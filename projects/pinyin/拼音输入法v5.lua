@@ -17,6 +17,8 @@
 -- 开放函数：Smart / Query / Prefix / Abbr / Sentence / Correct / Type / Status / Warm
 --================================================================
 
+local Script = {}
+
 Script.propertys = {
     tableIdsText = {
         type = Mini.String,
@@ -1504,3 +1506,5 @@ function Script:OnDestroy()
     SEGCACHE = {}
     ROWSCACHE = {}
 end
+
+return Script
