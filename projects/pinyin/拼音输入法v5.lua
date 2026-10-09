@@ -137,6 +137,11 @@ Script.openFnArgs = {
         returnType = Mini.String,
         displayName = "状态诊断"
     },
+    Diag = {
+        returnType = Mini.String,
+        displayName = "详细诊断",
+        params = { "二维表ID", Mini.String }
+    },
 }
 
 local Inflater = {}
@@ -577,11 +582,16 @@ local function pickField(row)
     return best or row[1]
 end
 
+-- 读二维表。playerId 必须传 nil（全局表）；传 1 在本版本返回 nil。
+-- 这是从能跑通的权重脚本里抄的写法：先试 nil，再试 0，都空则原样返回。
 local function readTable(tid)
     if not (Data and Data.Table and Data.Table.GetAllValue) then return nil end
-    local ok, rows = pcall(function() return Data.Table:GetAllValue(tid, 1) end)
-    if not ok or type(rows) ~= "table" then return nil end
-    return rows
+    local ok, rows = pcall(Data.Table.GetAllValue, Data.Table, tid, nil)
+    if ok and type(rows) == "table" and #rows > 0 then return rows end
+    local ok2, rows2 = pcall(Data.Table.GetAllValue, Data.Table, tid, 0)
+    if ok2 and type(rows2) == "table" and #rows2 > 0 then return rows2 end
+    if ok and type(rows) == "table" then return rows end
+    return nil
 end
 
 --================ UTF-8 切分（0-based 数组）================
@@ -620,14 +630,44 @@ local SELFREF = nil   -- OnStart 里保存 self，运行时属性值从 self 读
 -- 从字符串数组属性读取 ID（逐项过滤空串与过短项）
 local function collectIds(arr)
     local t = {}
-    if not arr then return t end
-    local ok, n = pcall(function() return #arr end)
-    if not ok or not n then return t end
+    if arr == nil then return t end
+    local n = nil
+    local ok, r = pcall(function() return #arr end)
+    if ok and type(r) == "number" then n = r end
+    if not n or n <= 0 then
+        -- 长度取不到（userdata 无 __len）：按 0-based 逐项探测到空为止
+        for i = 0, 63 do
+            local ok2, v = pcall(function() return arr[i] end)
+            if not ok2 or v == nil then break end
+            if type(v) == "string" and #v > 3 then t[#t + 1] = v end
+        end
+        return t
+    end
     for i = 1, n do
-        local v = arr[i]
-        if type(v) == "string" and #v > 3 then t[#t + 1] = v end
+        local ok2, v = pcall(function() return arr[i] end)
+        if ok2 and type(v) == "string" and #v > 3 then t[#t + 1] = v end
     end
     return t
+end
+
+-- 属性读取：优先组件实例 self，回退 Script[name]（引擎注入到裸表），
+-- 绝不读 Script.propertys[name].default（那是定义期占位，不是运行时值）
+local function getProp(name)
+    if SELFREF ~= nil then
+        local ok, x = pcall(function() return SELFREF[name] end)
+        if ok and x ~= nil then return x end
+    end
+    local ok2, x2 = pcall(function() return Script[name] end)
+    if ok2 and x2 ~= nil then return x2 end
+    return nil
+end
+
+-- 惰性初始化：任何开放函数进来都能自愈，不依赖 OnStart 一定成功
+local function ensureInit(self)
+    if SELFREF == nil and self ~= nil then SELFREF = self end
+    if #IDS > 0 then return end
+    IDS = collectIds(getProp("tableIds"))
+    if #IDS == 0 then SCANNED = false end
 end
 
 -- 扫描所有表，建立 SEGPOS（每行自带段号：C|<sid>|<载荷分片>）
@@ -796,11 +836,7 @@ end
 
 -- 运行时属性值由引擎注入到 self 上，读 SELFREF[name]（self 在 OnStart 保存）
 local function propNum(name, dft)
-    local v = SELFREF and SELFREF[name]
-    if v == nil then
-        local p = Script.propertys and Script.propertys[name]
-        if p then v = p.default end
-    end
+    local v = getProp(name)
     v = tonumber(v)
     if v == nil then return dft end
     return v
@@ -935,6 +971,7 @@ end
 
 --================ 开放函数 =================
 function Script:Query(pinyin, n)
+    ensureInit(self)
     n = tonumber(n) or 1
     local py = tostring(pinyin or ""):lower():gsub("[^a-z]", "")
     if py == "" then return "" end
@@ -949,6 +986,7 @@ function Script:Query(pinyin, n)
 end
 
 function Script:Prefix(pinyin, n)
+    ensureInit(self)
     n = tonumber(n) or propNum("maxResult", 20)
     local py = tostring(pinyin or ""):lower():gsub("[^a-z]", "")
     if py == "" then return "" end
@@ -978,6 +1016,7 @@ function Script:Prefix(pinyin, n)
 end
 
 function Script:Abbr(str, n)
+    ensureInit(self)
     n = tonumber(n) or propNum("maxResult", 20)
     local s = tostring(str or ""):lower():gsub("[^a-z]", "")
     if s == "" then return "" end
@@ -1014,6 +1053,7 @@ local function greedyCut(s, maxlen)
 end
 
 function Script:Sentence(str, n)
+    ensureInit(self)
     n = tonumber(n) or 1
     local s = tostring(str or ""):lower():gsub("[^a-z]", "")
     if s == "" then return "" end
@@ -1045,6 +1085,7 @@ function Script:Sentence(str, n)
 end
 
 function Script:Warm(bucket)
+    ensureInit(self)
     local b = tostring(bucket or ""):lower():gsub("[^a-z]", "")
     if b == "" then return "桶名为空" end
     local heads = bucketHeads(b)
@@ -1057,6 +1098,7 @@ function Script:Warm(bucket)
 end
 
 function Script:Status()
+    ensureInit(self)
     local ok = scanAll()
     if not ok then return "ERR " .. tostring(SCAN_ERR) end
     local lines = {}
@@ -1078,21 +1120,55 @@ function Script:Status()
     return table.concat(lines, " | ")
 end
 
+function Script:Diag(tid)
+    ensureInit(self)
+    local L = {}
+    L[#L + 1] = "IDS=" .. #IDS
+    local a = getProp("tableIds")
+    L[#L + 1] = "prop.type=" .. type(a)
+    if a ~= nil then
+        local ok, n = pcall(function() return #a end)
+        L[#L + 1] = "len.ok=" .. tostring(ok) .. " len=" .. tostring(n)
+        local ok1, v1 = pcall(function() return a[1] end)
+        local ok0, v0 = pcall(function() return a[0] end)
+        L[#L + 1] = "a[1]=" .. tostring(ok1 and v1) .. " a[0]=" .. tostring(ok0 and v0)
+    end
+    L[#L + 1] = "SELFREF=" .. tostring(SELFREF ~= nil)
+    local t = tid
+    if t == nil or t == "" then t = IDS[1] end
+    if t == nil or t == "" then
+        L[#L + 1] = "无ID可读"
+    else
+        L[#L + 1] = "tid=" .. t
+        local rows = readTable(t)
+        if not rows then
+            L[#L + 1] = "readTable=nil(API缺失或ID错)"
+        else
+            local c = 0
+            for _ in pairs(rows) do c = c + 1 end
+            L[#L + 1] = "rows=" .. c
+            local okr, r1 = pcall(function() return rows[1] end)
+            L[#L + 1] = "row1=" .. tostring(okr and (type(r1) == "table" and tostring(r1[1]) or tostring(r1)))
+        end
+    end
+    return table.concat(L, " | ")
+end
+
 function Script:OnStart()
     SELFREF = self
-    IDS = collectIds(self.tableIds)
+    IDS = collectIds(getProp("tableIds"))
     local ok = scanAll()
     if not ok then
-        print("[拼音v4] " .. tostring(SCAN_ERR))
+        print("[拼音v5] " .. tostring(SCAN_ERR))
         return
     end
     local c = 0
     for _ in pairs(SEGPOS) do c = c + 1 end
-    print("[拼音v4] 表=" .. #IDS .. " 已扫段号=" .. c)
+    print("[拼音v5] 表=" .. #IDS .. " 已扫段号=" .. c)
     if loadNames() then
-        print("[拼音v4] 段名=" .. #NAMES)
+        print("[拼音v5] 段名=" .. #NAMES)
     else
-        print("[拼音v4] MANIFEST 读取失败: " .. tostring(LAST_ERR))
+        print("[拼音v5] MANIFEST 读取失败: " .. tostring(LAST_ERR))
     end
 end
 
@@ -1479,6 +1555,7 @@ end
 
 --================ 开放函数：Smart / Correct / Type =================
 function Script:Smart(input, n)
+    ensureInit(self)
     n = tonumber(n) or 1
     if n < 1 then n = 1 end
     local s = tostring(input or "")
@@ -1497,6 +1574,7 @@ function Script:Smart(input, n)
 end
 
 function Script:Correct(pinyin)
+    ensureInit(self)
     local py = tostring(pinyin or ""):lower():gsub("[^a-z]", "")
     if py == "" then return "" end
     if queryExact(py) then return py .. "  (无需纠正)" end
@@ -1508,6 +1586,7 @@ function Script:Correct(pinyin)
 end
 
 function Script:Type(input)
+    ensureInit(self)
     local s = tostring(input or "")
     if s == "" then return "" end
     local tk = mergePick(tokenize(s))
