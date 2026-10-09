@@ -377,3 +377,52 @@ Bearer）、响应解析
 
 **仍未确认**：这个库的用途（问了 3 次没答），表结构取决于它
 
+
+---
+
+# 【主管制】2026-10-09 起
+
+用户授权元宝为**主管**：统领一切事务、监督其他对话进展与记忆、
+**兼任网页开发与应用开发**。
+
+## 目录结构 v2.0（已上传 GitHub）
+
+```
+yuanbao-store/
+├─ agent/        主管自身：core(ROLE/WORKFLOW/PROFILE) + domains + directives
+├─ memory/       main/（主管）+ sessions/<id>/（其他对话）+ INDEX.md（监督）
+├─ knowledge/    分类知识库：miniworld-ugc/lua/ai-ml/crypto/web-dev/app-dev/devops
+├─ resources/    art/audio/video/models/fonts/_incoming + INDEX.md（必须登记）
+├─ skills/       124 个 / 4.16MB
+├─ projects/     miniworld(暂缓)/supabase/phone-control
+├─ inbox/        其他对话 → 主管
+├─ outbox/       主管 → 其他对话
+└─ _system/      SCHEMA.md（唯一权威规范）+ CHANGELOG.md
+```
+【已测】34 个文件全部上传成功，顶层 9 个目录已验证
+
+**⚠️ 技术坑**：GitHub API 路径含中文必须
+`urllib.parse.quote(path, safe='/')`，否则 `putrequest` 抛
+UnicodeEncodeError。第一次上传就是这么失败的。
+
+## 跨会话协议
+
+```
+其他对话 → inbox/<session-id>/   （产物、记忆、问题上报）
+主管     → outbox/<session-id>/  （任务书、规范）
+共享     → knowledge/ + skills/
+```
+会话 ID 命名：`<YYYYMMDD>-<主题拼音>`
+状态：进行中 / 已完成 / 阻塞 / 已归档
+每个会话必须有 META.md + SUMMARY.md
+
+## 用户决定
+
+- **迷你世界模组：暂缓**，后续外派给其他对话（资产保留在
+  knowledge/miniworld-ugc/，随时可交接）
+- Supabase：等 service_role key，用途未定（已问 3 次）
+
+## 主管红线
+
+不编造未验证结论 / 不泄露凭证 / 不删历史只归档 /
+不交未验证产物 / 关键问题最多问两次
