@@ -10,7 +10,7 @@
 --   4) 字典/符号表存原文 + 段名带字节长度，解码按长度截断，不再越界
 --
 -- 用法：把 csv/py4_01.csv ~ py4_15.csv 导入二维表，
---       把 15 个表 ID 填进属性 tableIdsText（逗号分隔）。
+--       把 15 个表 ID 逐项填进属性 tableIds（字符串数组，已预设 15 个槽位）。
 --
 -- v5 新增：Smart（混合输入自动判断）/ Correct（26键容错纠错）/ Type（类型诊断）
 --
@@ -20,11 +20,29 @@
 local Script = {}
 
 Script.propertys = {
-    tableIdsText = {
-        type = Mini.String,
-        default = "",
+    tableIds = {
+        type = Mini.Array,
+        itemType = Mini.String,
+        default = Mini.Array(Mini.String,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ""
+        ),
         displayName = "二维表ID组",
-        tips = "15 张词库二维表的 ID，逗号分隔。导入 csv/py4_01..15.csv 后填入"
+        customDisplayName = "表ID",
+        tips = "15 张词库二维表的 ID，每项一行。导入 csv/py4_01..15.csv 后逐个填入"
     },
     maxResult = {
         type = Mini.Number,
@@ -120,7 +138,6 @@ Script.openFnArgs = {
         displayName = "状态诊断"
     },
 }
-Script.openFunctions = Script.openFnArgs
 
 local Inflater = {}
 --================ 0. bit 操作（迷你 bit 模块，一定存在）=================
@@ -599,11 +616,15 @@ local DIC, ASC = nil, nil
 local NB1, NB2 = 0, 0
 local LAST_ERR = nil
 
-local function parseIds(text)
+-- 从字符串数组属性读取 ID（逐项过滤空串与过短项）
+local function collectIds(arr)
     local t = {}
-    if type(text) ~= "string" then return t end
-    for w in text:gmatch("[^,%s]+") do
-        if #w > 3 then t[#t + 1] = w end
+    if not arr then return t end
+    local ok, n = pcall(function() return #arr end)
+    if not ok or not n then return t end
+    for i = 1, n do
+        local v = arr[i]
+        if type(v) == "string" and #v > 3 then t[#t + 1] = v end
     end
     return t
 end
@@ -611,11 +632,8 @@ end
 -- 扫描所有表，建立 SEGPOS（每行自带段号：C|<sid>|<载荷分片>）
 local function scanAll()
     if SCANNED then return true end
-    IDS = parseIds(Script.propertys and Script.propertys.tableIdsText and
-                   (Script.propertys.tableIdsText.value or
-                    Script.propertys.tableIdsText.default) or "")
     if #IDS == 0 then
-        SCAN_ERR = "属性 tableIdsText 为空：请先导入二维表并填入 ID"
+        SCAN_ERR = "属性 tableIds 为空：请先导入二维表并把 15 个 ID 逐项填入"
         return false
     end
     SEGPOS = {}
@@ -1058,6 +1076,11 @@ function Script:Status()
 end
 
 function Script:OnStart()
+    IDS = collectIds(self.tableIds)
+    if #IDS == 0 then
+        IDS = collectIds(Script.propertys and Script.propertys.tableIds
+                         and Script.propertys.tableIds.default or nil)
+    end
     local ok = scanAll()
     if not ok then
         print("[拼音v4] " .. tostring(SCAN_ERR))
