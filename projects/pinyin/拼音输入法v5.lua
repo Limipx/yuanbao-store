@@ -615,6 +615,7 @@ local TOTAL_TABLES = nil
 local DIC, ASC = nil, nil
 local NB1, NB2 = 0, 0
 local LAST_ERR = nil
+local SELFREF = nil   -- OnStart 里保存 self，运行时属性值从 self 读
 
 -- 从字符串数组属性读取 ID（逐项过滤空串与过短项）
 local function collectIds(arr)
@@ -793,11 +794,13 @@ local function split(s, sep)
     return t
 end
 
+-- 运行时属性值由引擎注入到 self 上，读 SELFREF[name]（self 在 OnStart 保存）
 local function propNum(name, dft)
-    local p = Script.propertys and Script.propertys[name]
-    if not p then return dft end
-    local v = p.value
-    if v == nil then v = p.default end
+    local v = SELFREF and SELFREF[name]
+    if v == nil then
+        local p = Script.propertys and Script.propertys[name]
+        if p then v = p.default end
+    end
     v = tonumber(v)
     if v == nil then return dft end
     return v
@@ -1076,11 +1079,8 @@ function Script:Status()
 end
 
 function Script:OnStart()
+    SELFREF = self
     IDS = collectIds(self.tableIds)
-    if #IDS == 0 then
-        IDS = collectIds(Script.propertys and Script.propertys.tableIds
-                         and Script.propertys.tableIds.default or nil)
-    end
     local ok = scanAll()
     if not ok then
         print("[拼音v4] " .. tostring(SCAN_ERR))
@@ -1526,6 +1526,8 @@ end
 
 
 function Script:OnDestroy()
+    SELFREF = nil
+    IDS = {}
     SEGCACHE = {}
     ROWSCACHE = {}
 end
