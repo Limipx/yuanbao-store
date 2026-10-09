@@ -1,44 +1,41 @@
-# yuanbao-store（Limipx）
+# yuanbao-store · Limipx 资产总库 v2.0
 
-长期存储仓库：**技能库 + Agent 画像 + 手机上传文件**
+> 元宝（主管）统领。目录规范见 `_system/SCHEMA.md`。
 
-| 路径 | 内容 |
+## 结构
+
+| 目录 | 用途 |
 |---|---|
-| `skills/` | 技能库，一个子文件夹 = 一个技能（`skills.tar.gz`，29 个） |
-| `agent/` | Agent 画像：`core/PROFILE.md` 核心能力 + `domains/*.md` 领域专长 |
-| `uploads/` | 手机上传器写入，`uploads/<批次ID>/` |
+| `agent/` | 主管自身定义：职责、工作规范、领域专长、行为准则 |
+| `memory/` | 记忆区：本会话 + 其他所有对话（含索引与状态） |
+| `knowledge/` | 分类公共知识库：可复用、经实测的结论 |
+| `resources/` | 资源区：美术 / 音频 / 视频 / 建模 / 字体 |
+| `skills/` | 技能库（124 个 / 4.16MB） |
+| `projects/` | 长期项目 |
+| `inbox/` | 收件箱：其他对话 → 主管 |
+| `outbox/` | 发件箱：主管 → 其他对话 |
+| `_system/` | 目录规范 + 变更记录 |
 
-## 恢复命令（推荐 jsdelivr，国内更快更稳）
+## 恢复技能库
 
 ```bash
-# 技能库（269 文件 / 3.1MB）
-curl -L -o skills.tar.gz https://cdn.jsdelivr.net/gh/Limipx/yuanbao-store@main/skills/skills.tar.gz
+curl -L -o skills.tar.gz \
+  https://cdn.jsdelivr.net/gh/Limipx/yuanbao-store@<COMMIT_SHA>/skills/skills.tar.gz
 mkdir -p /data/skills && tar -xzf skills.tar.gz -C /data/skills --strip-components=1
-
-# Agent 画像
-curl -L -o agent.tar.gz https://cdn.jsdelivr.net/gh/Limipx/yuanbao-store@main/agent/agent.tar.gz
-tar -xzf agent.tar.gz -C /data/workspace
 ```
 
-备选（若 jsdelivr 不通）：
-```bash
-https://raw.githubusercontent.com/Limipx/yuanbao-store/main/skills/skills.tar.gz
-```
+⚠️ 必须用 **commit SHA**，不能用 `@main`（jsdelivr 有缓存）。
 
-## 上传器 APK
+## 其他对话开工前
 
-Release 直链（任何人可下载，无需登录）：
-```
-https://github.com/Limipx/yuanbao-store/releases/download/v1.0/YuanbaoUploader.apk
-```
+1. 恢复技能库
+2. 读 `agent/core/ROLE.md` + `_system/SCHEMA.md`
+3. 读 `memory/INDEX.md` 查有没有人做过
+4. 读 `agent/directives/实测优先.md`
 
-## 约定
+## 主管（元宝）
 
-- 数据一律**压缩后**入库（tar.gz），避免零散小文件
-- 单文件 100MB 硬限、单 blob 约 40MB，压缩 + 分片更安全
-- 新技能回存时打成 tar.gz 传进 `skills/`
-
-## 状态
-
-- skills：269 文件，7.1MB → **3.1MB（2.26x）**
-- agent：6 文件，7KB
+- **职责**：统领、监督、记忆、规范
+- **亲自做**：网页开发、应用开发
+- **专用读写**：`memory/main/`、`agent/`（仅主管可改）
+- 其他对话写 `inbox/` 和自己的 `memory/sessions/<id>/`
