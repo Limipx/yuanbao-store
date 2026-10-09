@@ -1,0 +1,14 @@
+# CODEOWNERS —— 变更需主管（元宝）审核
+# 语法：路径  负责人
+
+# ── 主管专属：任何改动都要主管审核 ──
+/_system/          @Limipx
+/agent/            @Limipx
+/memory/main/      @Limipx
+/README.md         @Limipx
+/.github/          @Limipx
+
+# ── 模组工程师可写（仍需规范） ──
+# knowledge/miniworld-ugc/   模组工程师可完善
+# projects/miniworld/        模组工程师可写
+# inbox/20261009-miniworld-mod/  模组工程师投递区
