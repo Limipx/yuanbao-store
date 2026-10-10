@@ -1,0 +1,3683 @@
+--====================================================================
+-- 迷你中文对话模型（迷你世界 UGC 3.0 · Lua 5.1 组件脚本）
+--
+-- 用法：
+--   1. 把模型数据导入 14 个二维表，ID 依次为 llm_data_1 .. llm_data_14
+--      （每个表 ≤2000 行、≤512KB，数据已是 Base85 可打印文本）
+--   2. 组件属性 tableIds 里按顺序填好这些 ID
+--   3. 触发器里调：Script:Chat("会话ID", "用户说的话")  返回回复文本
+--
+-- 开放函数：
+--   Chat(sessionId, userText)    对话（会话ID 记上下文）
+--   RateReply(sessionId, score)  给上一句回答打分（好评记住/差评换一条）
+--   AddKnowledge(text)           追加资料（『问法|问法|答案』）
+--   ExportKnowledge()            导出资料库（压缩文本，粘进 kbData 属性）
+--   KbStats()                    资料库与缓存统计
+--   ResetSession(sessionId)      清空某会话历史
+--   GetSessionInfo(sessionId)    查看会话记录（调试）
+--   ModelStats()                 模型加载状态（调试）
+--   ProbeTable(tableId)          探测二维表是否可读（调试）
+--
+-- 原理（如实说明）：
+--   这是「检索式对话」，不是 GPT 那样的生成式大模型。
+--   语料库里存了 25 万条真实中文问答，回答时在你的输入和所有问句之间
+--   算加权余弦相似度（字符 bigram + 单字 IDF），挑最像的那条的答案返回。
+--   所以它接得住常见闲聊、问好、吐槽、追问，但不会自己造句，
+--   也没有常识推理和算术能力。参数全在组件属性里可调。
+--
+-- 资料库（新增）：组件属性 knowledgeBase（字符串数组，9999 条）里填自定义资料，
+--   格式『问法1|问法2|答案』——最后一个竖线后是答案，前面全是问法，
+--   换种说法问也能命中。内部做 bigram 词典压缩 + 增量储存。
+--   也可在触发器里用 AddKnowledge 运行时追加（增量，不全量重建）。
+--
+-- 回答缓存（新增）：高分回答自动记住，下次同样的问题零耗时返回；
+--   用 RateReply 给回答打分，好评强制记住、差评忘掉并换一条。
+--   缓存可以用 导出缓存 导出文本，粘进 answerCache 属性实现持久化。
+--
+-- 数据规模：14 个二维表 / 256 个桶 / 4000 个单字权重
+--           另有生成模型 3 个二维表（字符 3-gram 统计模型）
+--====================================================================
+local Script = {}
+
+Script.propertys = {
+    tableIdsText = {
+        type = Mini.String,
+        default = "v7692856137548737533110822,v7692856244922919933110824,v7692856300757494781110826,v7692856339412200445110828,v7692856378066906109110830,v7692856421016579069110832,v7692856459671284733110834,v7692856502620957693110836,v7692856545570630653110838,v7692856575635401725110840,v7692856601405205501110842,v7692856631469976573110844,v7692856661534747645110846,v7692856691599518717110848",
+        displayName = "二维表ID组(逗号分隔)",
+        tips = "按顺序填入 14 个二维表ID，英文逗号分隔。留空则自动用内置默认 ID"
+    },
+    genMode = {
+        type = Mini.Number,
+        default = 1,
+        displayName = "生成方式",
+        minValue = 0,
+        maxValue = 2,
+        format = "%.0f",
+        tips = "0=纯检索(原样返回语料原句，与旧版一致) 1=检索取种子+统计造句 2=纯统计造句(不看语料答案)"
+    },
+    ngTableIdsText = {
+        type = Mini.String,
+        default = "",
+        displayName = "生成模型表ID(逗号分隔)",
+        tips = "导入 ng_data_1..ng_data_3 三张二维表后，按顺序填入 3 个 ID，英文逗号分隔。留空则退回纯检索"
+    },
+    ngTableIds = {
+        type = Mini.Array,
+        itemType = Mini.String,
+        maxNum = 8,
+        displayName = "生成模型表ID(数组)",
+        tips = "与上一项二选一，数组形式。两项都填时以此项为准"
+    },
+    genKeep = {
+        type = Mini.Number,
+        default = 4,
+        displayName = "保留种子字数",
+        minValue = 0,
+        maxValue = 12,
+        format = "%.0f字",
+        tips = "模式1下，从检索到的答案里保留前几个字当种子，后面由统计模型接。越大越贴原句，越小越自由"
+    },
+    genTries = {
+        type = Mini.Number,
+        default = 5,
+        displayName = "采样次数",
+        minValue = 1,
+        maxValue = 12,
+        format = "%.0f次",
+        tips = "每次生成几句候选，按平均权重挑最好的。次数越多越稳也越慢"
+    },
+    genMaxLen = {
+        type = Mini.Number,
+        default = 30,
+        displayName = "生成最大字数",
+        minValue = 4,
+        maxValue = 60,
+        format = "%.0f字",
+        tips = "统计生成容易跑飞，这里是硬上限"
+    },
+    genGreedy = {
+        type = Mini.Bool,
+        default = false,
+        displayName = "总是取最大概率",
+        tips = "关掉=按权重随机采样(每次不一样) 打开=每次取概率最大的字(稳定但呆板)"
+    },
+    preloadNG = {
+        type = Mini.Bool,
+        default = false,
+        displayName = "启动预载生成模型",
+        tips = "打开后 OnStart 就解析 3-gram 模型(约 1-3 秒)，之后对话无延迟；关闭则首次生成时才解析"
+    },
+    topBuckets = {
+        type = Mini.Number,
+        default = 6,
+        displayName = "检索桶数",
+        minValue = 1,
+        maxValue = 32,
+        format = "%.0f个",
+        tips = "每次对话加载并扫描几个桶。越大越准也越慢，1个桶约20-40ms"
+    },
+    minScore = {
+        type = Mini.Number,
+        default = 0.16,
+        displayName = "最低匹配分",
+        minValue = 0,
+        maxValue = 1,
+        format = "%.3f",
+        tips = "低于此分判定为没听懂，走兜底回复。调高更保守，调低更爱接话"
+    },
+    minCoverage = {
+        type = Mini.Number,
+        default = 0.25,
+        displayName = "最低覆盖比例",
+        minValue = 0,
+        maxValue = 1,
+        format = "%.2f",
+        tips = "查询里至少有多少比例的字要真的出现在命中问句里。低于此值判为乱码/无关，直接兜底"
+    },
+    contextTurns = {
+        type = Mini.Number,
+        default = 2,
+        displayName = "上下文轮数",
+        minValue = 0,
+        maxValue = 10,
+        format = "%.0f轮",
+        tips = "记住最近几轮对话。0=完全不看上下文"
+    },
+    enableContext = {
+        type = Mini.Bool,
+        default = true,
+        displayName = "启用上下文",
+        tips = "关闭后每句话都独立处理，不参考上文"
+    },
+    replyMaxLen = {
+        type = Mini.Number,
+        default = 60,
+        displayName = "回复最大长度",
+        minValue = 0,
+        maxValue = 500,
+        format = "%.0f字",
+        tips = "0=不截断"
+    },
+    fallbackMode = {
+        type = Mini.Number,
+        default = 1,
+        displayName = "兜底方式",
+        minValue = 0,
+        maxValue = 2,
+        format = "%.0f",
+        tips = "0=固定一句 1=随机追问 2=引用上文反问"
+    },
+    preloadBuckets = {
+        type = Mini.Number,
+        default = 0,
+        displayName = "启动预加载桶数",
+        minValue = 0,
+        maxValue = 64,
+        format = "%.0f个",
+        tips = "OnStart 时预解压几个桶，降低首轮延迟，但会增加启动耗时"
+    },
+    hedgeScore = {
+        type = Mini.Number,
+        default = 0.35,
+        displayName = "自信阈值",
+        minValue = 0,
+        maxValue = 1,
+        format = "%.2f",
+        tips = "匹配分低于此值时，先反问确认再说答案，避免答非所问。设为 0 可关闭"
+    },
+    enableHedge = {
+        type = Mini.Bool,
+        default = true,
+        displayName = "启用反问确认",
+        tips = "关闭后，低分也直接给答案"
+    },
+    knowledgeBase = {
+        type = Mini.Array,
+        itemType = Mini.String,
+        maxNum = 9999,
+        displayName = "资料库(自定义问答)",
+        tips = "一条一个问答。格式『问法1|问法2|答案』，最后一个竖线后面是答案，前面全是问法（换种说法也能命中）。不含竖线则整条当答案。命中优先级高于内置语料"
+    },
+    kbData = {
+        type = Mini.String,
+        default = "",
+        displayName = "资料库(持久化·压缩)",
+        tips = "把 导出资料库 返回的文本粘进来，下次启动自动加载。留空则每次从数组重建"
+    },
+    kbText = {
+        type = Mini.String,
+        default = "",
+        displayName = "资料库(文本·备用)",
+        tips = "数组填不了时用它，一条一行，用换行分隔。与资料库数组合并生效，条数不限"
+    },
+    answerCache = {
+        type = Mini.String,
+        default = "",
+        displayName = "回答缓存(持久化)",
+        tips = "把 导出缓存 返回的内容粘进来，下次启动直接命中高分回答"
+    },
+    cacheMinScore = {
+        type = Mini.Number,
+        default = 0.55,
+        displayName = "自动缓存门槛",
+        minValue = 0,
+        maxValue = 1,
+        format = "%.2f",
+        tips = "匹配分高于此值才自动写入缓存。只有高分回答才值得记住"
+    },
+    kbMinScore = {
+        type = Mini.Number,
+        default = 0.35,
+        displayName = "资料库命中门槛",
+        minValue = 0,
+        maxValue = 1,
+        format = "%.2f",
+
+        tips = "资料库匹配分低于此值就当没命中，继续查内置语料。实测换问法的正例均分 0.62、负例 0.07，0.35 比较稳；调低更爱接话，调高更保守"
+    },
+    cacheMax = {
+        type = Mini.Number,
+        default = 300,
+        displayName = "缓存条数上限",
+        minValue = 0,
+        maxValue = 5000,
+        format = "%.0f条",
+        tips = "超出后淘汰最久未用的。0=关闭缓存"
+    },
+    rateGood = {
+        type = Mini.Number,
+        default = 4,
+        displayName = "好评分数线",
+        minValue = 1,
+        maxValue = 5,
+        format = "%.0f分",
+        tips = "打分>=此值算好评，强制记住这条回答；<=2分算差评，忘掉并换一条"
+    },
+    debugMode = {
+        type = Mini.Bool,
+        default = false,
+        displayName = "调试输出",
+        tips = "打印检索分数、扫描条数、耗时"
+    }
+}
+
+Script.openFnArgs = {
+    Chat = {
+        returnType = Mini.String,
+        displayName = "对话",
+        params = {
+            "会话ID", Mini.String,
+            "用户文本", Mini.String
+        }
+    },
+    SetNgIds = {
+        returnType = Mini.String,
+        displayName = "设置生成表ID组",
+        params = { "ID组(逗号分隔)", Mini.String }
+    },
+    Gen = {
+        returnType = Mini.String,
+        displayName = "统计造句(调试)",
+        params = { "种子文本", Mini.String }
+    },
+    GenStats = {
+        returnType = Mini.String,
+        displayName = "生成模型状态(调试)",
+        params = {}
+    },
+    ResetSession = {
+        displayName = "重置会话",
+        params = { "会话ID", Mini.String }
+    },
+    GetSessionInfo = {
+        returnType = Mini.String,
+        displayName = "查看会话(调试)",
+        params = { "会话ID", Mini.String }
+    },
+    ModelStats = {
+        returnType = Mini.String,
+        displayName = "模型状态(调试)",
+        params = {}
+    },
+    ProbeTable = {
+        returnType = Mini.String,
+        displayName = "探二维表(调试)",
+        params = { "二维表ID", Mini.String }
+    },
+    Diagnose = {
+        returnType = Mini.String,
+        displayName = "全面自检(调试)",
+        params = {}
+    },
+    DiagBucket = {
+        returnType = Mini.String,
+        displayName = "单桶诊断(调试)",
+        params = { "桶号", Mini.Number }
+    },
+    FailedBuckets = {
+        returnType = Mini.String,
+        displayName = "失败桶列表(调试)",
+        params = {}
+    },
+    SetTableIds = {
+        returnType = Mini.String,
+        displayName = "设置二维表ID组",
+        params = { "ID组(逗号分隔)", Mini.String }
+    },
+    GetTableIds = {
+        returnType = Mini.String,
+        displayName = "查看当前ID组(调试)",
+        params = {}
+    },
+    QuickCheck = {
+        returnType = Mini.String,
+        displayName = "快检(调试)",
+        params = {}
+    },
+    RateReply = {
+        returnType = Mini.String,
+        displayName = "给回答打分",
+        params = { "会话ID", Mini.String, "评分", Mini.Number }
+    },
+    AddKnowledge = {
+        returnType = Mini.String,
+        displayName = "追加资料",
+        params = { "资料(问题|答案)", Mini.String }
+    },
+    ClearKnowledge = {
+        returnType = Mini.String,
+        displayName = "清空资料库",
+        params = {}
+    },
+    ExportCache = {
+        returnType = Mini.String,
+        displayName = "导出缓存",
+        params = {}
+    },
+    ImportCache = {
+        returnType = Mini.String,
+        displayName = "导入缓存",
+        params = { "缓存文本", Mini.String }
+    },
+    ClearCache = {
+        returnType = Mini.String,
+        displayName = "清空缓存",
+        params = {}
+    },
+    KbStats = {
+        returnType = Mini.String,
+        displayName = "资料库与缓存统计",
+        params = {}
+    },
+    ExportKnowledge = {
+        returnType = Mini.String,
+        displayName = "导出资料库",
+        params = {}
+    },
+    ImportKnowledge = {
+        returnType = Mini.String,
+        displayName = "导入资料库",
+        params = { "资料库文本", Mini.String }
+    }
+}
+
+
+--==================== 桶索引：桶 -> {表索引, 起始行, 结束行} ====================
+local MANIFEST = {
+    [0]={0,0,89},
+    [1]={0,89,176},
+    [2]={0,176,259},
+    [3]={0,259,357},
+    [4]={0,357,446},
+    [5]={0,446,522},
+    [6]={0,522,605},
+    [7]={0,605,682},
+    [8]={0,682,766},
+    [9]={0,766,856},
+    [10]={0,856,941},
+    [11]={0,941,1022},
+    [12]={0,1022,1118},
+    [13]={0,1118,1205},
+    [14]={0,1205,1293},
+    [15]={0,1293,1382},
+    [16]={0,1382,1475},
+    [17]={0,1475,1556},
+    [18]={1,0,81},
+    [19]={1,81,167},
+    [20]={1,167,250},
+    [21]={1,250,329},
+    [22]={1,329,412},
+    [23]={1,412,501},
+    [24]={1,501,574},
+    [25]={1,574,649},
+    [26]={1,649,732},
+    [27]={1,732,809},
+    [28]={1,809,895},
+    [29]={1,895,984},
+    [30]={1,984,1054},
+    [31]={1,1054,1146},
+    [32]={1,1146,1225},
+    [33]={1,1225,1300},
+    [34]={1,1300,1391},
+    [35]={1,1391,1472},
+    [36]={1,1472,1572},
+    [37]={2,0,83},
+    [38]={2,83,161},
+    [39]={2,161,241},
+    [40]={2,241,328},
+    [41]={2,328,409},
+    [42]={2,409,488},
+    [43]={2,488,566},
+    [44]={2,566,635},
+    [45]={2,635,715},
+    [46]={2,715,797},
+    [47]={2,797,878},
+    [48]={2,878,954},
+    [49]={2,954,1050},
+    [50]={2,1050,1124},
+    [51]={2,1124,1205},
+    [52]={2,1205,1279},
+    [53]={2,1279,1359},
+    [54]={2,1359,1450},
+    [55]={2,1450,1531},
+    [56]={2,1531,1619},
+    [57]={3,0,81},
+    [58]={3,81,159},
+    [59]={3,159,228},
+    [60]={3,228,310},
+    [61]={3,310,397},
+    [62]={3,397,493},
+    [63]={3,493,583},
+    [64]={3,583,672},
+    [65]={3,672,765},
+    [66]={3,765,847},
+    [67]={3,847,934},
+    [68]={3,934,1013},
+    [69]={3,1013,1095},
+    [70]={3,1095,1187},
+    [71]={3,1187,1267},
+    [72]={3,1267,1351},
+    [73]={3,1351,1427},
+    [74]={3,1427,1512},
+    [75]={3,1512,1608},
+    [76]={4,0,89},
+    [77]={4,89,172},
+    [78]={4,172,250},
+    [79]={4,250,324},
+    [80]={4,324,422},
+    [81]={4,422,505},
+    [82]={4,505,595},
+    [83]={4,595,686},
+    [84]={4,686,774},
+    [85]={4,774,859},
+    [86]={4,859,936},
+    [87]={4,936,1017},
+    [88]={4,1017,1104},
+    [89]={4,1104,1198},
+    [90]={4,1198,1288},
+    [91]={4,1288,1385},
+    [92]={4,1385,1474},
+    [93]={4,1474,1566},
+    [94]={5,0,92},
+    [95]={5,92,181},
+    [96]={5,181,259},
+    [97]={5,259,352},
+    [98]={5,352,433},
+    [99]={5,433,523},
+    [100]={5,523,617},
+    [101]={5,617,708},
+    [102]={5,708,795},
+    [103]={5,795,875},
+    [104]={5,875,946},
+    [105]={5,946,1024},
+    [106]={5,1024,1096},
+    [107]={5,1096,1175},
+    [108]={5,1175,1269},
+    [109]={5,1269,1359},
+    [110]={5,1359,1454},
+    [111]={5,1454,1539},
+    [112]={5,1539,1610},
+    [113]={6,0,87},
+    [114]={6,87,164},
+    [115]={6,164,252},
+    [116]={6,252,330},
+    [117]={6,330,406},
+    [118]={6,406,488},
+    [119]={6,488,567},
+    [120]={6,567,651},
+    [121]={6,651,735},
+    [122]={6,735,822},
+    [123]={6,822,897},
+    [124]={6,897,988},
+    [125]={6,988,1078},
+    [126]={6,1078,1153},
+    [127]={6,1153,1235},
+    [128]={6,1235,1319},
+    [129]={6,1319,1405},
+    [130]={6,1405,1498},
+    [131]={6,1498,1590},
+    [132]={7,0,85},
+    [133]={7,85,165},
+    [134]={7,165,241},
+    [135]={7,241,318},
+    [136]={7,318,409},
+    [137]={7,409,489},
+    [138]={7,489,574},
+    [139]={7,574,657},
+    [140]={7,657,744},
+    [141]={7,744,836},
+    [142]={7,836,929},
+    [143]={7,929,1014},
+    [144]={7,1014,1100},
+    [145]={7,1100,1183},
+    [146]={7,1183,1272},
+    [147]={7,1272,1338},
+    [148]={7,1338,1416},
+    [149]={7,1416,1507},
+    [150]={7,1507,1597},
+    [151]={8,0,92},
+    [152]={8,92,184},
+    [153]={8,184,265},
+    [154]={8,265,350},
+    [155]={8,350,447},
+    [156]={8,447,521},
+    [157]={8,521,604},
+    [158]={8,604,696},
+    [159]={8,696,773},
+    [160]={8,773,857},
+    [161]={8,857,928},
+    [162]={8,928,1021},
+    [163]={8,1021,1118},
+    [164]={8,1118,1222},
+    [165]={8,1222,1306},
+    [166]={8,1306,1382},
+    [167]={8,1382,1467},
+    [168]={8,1467,1550},
+    [169]={9,0,84},
+    [170]={9,84,164},
+    [171]={9,164,256},
+    [172]={9,256,331},
+    [173]={9,331,405},
+    [174]={9,405,478},
+    [175]={9,478,562},
+    [176]={9,562,647},
+    [177]={9,647,739},
+    [178]={9,739,823},
+    [179]={9,823,903},
+    [180]={9,903,983},
+    [181]={9,983,1050},
+    [182]={9,1050,1142},
+    [183]={9,1142,1236},
+    [184]={9,1236,1328},
+    [185]={9,1328,1411},
+    [186]={9,1411,1491},
+    [187]={9,1491,1570},
+    [188]={10,0,87},
+    [189]={10,87,168},
+    [190]={10,168,259},
+    [191]={10,259,347},
+    [192]={10,347,428},
+    [193]={10,428,513},
+    [194]={10,513,591},
+    [195]={10,591,687},
+    [196]={10,687,764},
+    [197]={10,764,842},
+    [198]={10,842,928},
+    [199]={10,928,1014},
+    [200]={10,1014,1107},
+    [201]={10,1107,1179},
+    [202]={10,1179,1261},
+    [203]={10,1261,1344},
+    [204]={10,1344,1438},
+    [205]={10,1438,1523},
+    [206]={10,1523,1600},
+    [207]={11,0,76},
+    [208]={11,76,173},
+    [209]={11,173,264},
+    [210]={11,264,354},
+    [211]={11,354,451},
+    [212]={11,451,534},
+    [213]={11,534,624},
+    [214]={11,624,709},
+    [215]={11,709,812},
+    [216]={11,812,902},
+    [217]={11,902,992},
+    [218]={11,992,1071},
+    [219]={11,1071,1157},
+    [220]={11,1157,1235},
+    [221]={11,1235,1325},
+    [222]={11,1325,1420},
+    [223]={11,1420,1510},
+    [224]={11,1510,1595},
+    [225]={12,0,84},
+    [226]={12,84,166},
+    [227]={12,166,254},
+    [228]={12,254,331},
+    [229]={12,331,417},
+    [230]={12,417,515},
+    [231]={12,515,607},
+    [232]={12,607,689},
+    [233]={12,689,762},
+    [234]={12,762,827},
+    [235]={12,827,901},
+    [236]={12,901,1001},
+    [237]={12,1001,1090},
+    [238]={12,1090,1177},
+    [239]={12,1177,1261},
+    [240]={12,1261,1343},
+    [241]={12,1343,1432},
+    [242]={12,1432,1523},
+    [243]={12,1523,1615},
+    [244]={13,0,89},
+    [245]={13,89,184},
+    [246]={13,184,272},
+    [247]={13,272,353},
+    [248]={13,353,454},
+    [249]={13,454,541},
+    [250]={13,541,631},
+    [251]={13,631,719},
+    [252]={13,719,809},
+    [253]={13,809,894},
+    [254]={13,894,976},
+    [255]={13,976,1205},
+}
+
+--==================== 单字权重表（IDF 量化，1 字节/字）====================
+local CIDF_TXT = "你是我不的啊呀了么,鸡呢您好吗什说个有人一吃哪那要会大还小没爱谁就在喜道欢来想知中国怎子这为 下天可妹多真女上给都看家，去生能“学最睡啥”他回也公?主和话点出心过地。嘛死得？蛋时男以觉黄作里到对问认理名明老玩!叫又通聊很《》快只于成样起神识太发跟吧无才办用自别意开事机友代世母行年干傻长笨美马现电儿位界表毛算安饭日们语高气二物星品她咋被呵找动·做第听头打几哥情西肉把晚种少着演歌思本信何错今原业笑王后再白懂三猜句片早文朋关球之复放分东周比基2候让告列答手称方定法工考帅特花如山水1影经色唱然斯乐火海面拉运部北诉次钱边者科指数讲战间所司门嗯爷期景屁故字全先题难陪城加哎木炖址属因著当实南爸力肿请系等前德号姐该敢相累金见正红骂怕假月智屎戏乖座体坏a己记制器古变其结妈张牛类京滚克同尔萌、0教选试黑口常曲果英性重猪剧民调底解恋狗应脑首孩帮腿飞总身饿票导感院喝区搞度两项市活李挂校流线新园切传师刚由与奖言病亮鸭烤走啦诗逼o四军外聪害产卖命服车林从靠擦像员货（）视'象光空受书烦杀~奥风亲求臭游义利阿b河十米骗呗鸟平直阳买丝它华伤清谢合化商宝内史i八程些队奇毕节班台习3香单床t哼换包婚s稀讨形鱼恩炸婆量麻鬼丫统失胖万梦带建困厌漂五龙素忙眼更岛职冷石型馆味近进完朝尼疼远管9洲屌娘装嘴汉音午春刘式操哭脸词纪帝江强质编目夫油翅计历反弟e达术布许青皮瓜挺微亚确送改皇够博福l格奶哦百肥哈赛食n条掉专养级8介交画保根草写容爆省每路拜云巴源杰肯雨艺志提始洗卡兴罗立银烧破药湖速贝岁联斗离而治注爹唐已标恶非任韩哟获件武妖dp广将菜接兰但使血颜5元士射论辑资虫超扯绍夜创伦胡角r陈仔抱望际j政猫范准逗网晕承锅组负纸粑造场汤雪怪m4衣菇久段希酒波曾雄撒房热案照拔妇吖半州足丽便：咯爪h姓弃幸住处穿休欺忘除瞎苏揍土港蘑雷艾洋越森报厉息图滴孙共菊唉密存入丑舍c需争族收温领俩混推举双坑念序软y淫典设7g积向泰煮宋乱铁维千倒客夸kA欧势必湾宫决减医苦骚羞宇取译诶支愿料派抽麽终六辣疯声社证6普狼田跑示父护精牌权效俗压冰约激攻劲释功绿具跳撸纳冠喽杯观转楼初留未杨救七农姨q排构值规康豆麦独勒富慰连务居闻深夏姑诺配状圈拿.f媳羊窝兄炮紧研伊仙低霸棒差迪末峰技征呦谈良野娜围背顿满革嫌据费舞淡营冒断呆鼠卫吴伟搭映须痛陆永般玉圣寂肚整伯辛冬塔适鲁耳懒易环糖吹寞眠欠B姆堂态威熊咱落旅叶莫钓佳祖集九谷优读宗丁鼻脏健礼翔谅N败驴敷航凯昨娃蠢沙极茶弹呜短膀抗团怀兔闹晓块毒泡缺党树蓝松秋坦塞育菲嫁页衍噢甲浪吉镜消持哲暗简秘脚耍虎慢追妞随誉植则评桥荐牙官绝跪核虚况川莱粉兽轻魔街炒吓孤拍贵烟府劳怜糕响较济纯废摸曼输梅吐耶闷丹灵邪u敌圆展版-暴v胜赵恨摩述括佛玛织备顺击闲急播兵鸣查蒙呐枪宰脱荡宁借庄娶替M漫笔君赢呼遍托桑逻此凤朱财祝澡纠酸按律并私引暖及唯刀赶静采谱钟瘦桃碗杂修饼缘灰嘻码吊咬嘉寺偶届趣咩站继各泽雌恐续异模步剑胆猴刷崽议课梁惜爽耻鄙盆彩否耐童芳籍依印染测碎傲宜幼尿套S萨叉魂村板补饰瑞嘎莉喂x或郎尾琐插饱熟割C群乎曹雅昂率汽限紫止喊乌忍猥季参敏沟w扣粗库杜径份晨含遗藏吸庆郁狠迷坐阶材巨划盛娇醒袋细似弗柳弄篇汗役顶郭叔验控价狂央甜渴登室腊惹舒狱洞I冲究移乡瑟防侠镇鹿氓捏萝珠舰默篮裤葩阉D秒琴监致津币峡偷徐泳罕章摄却秀悲雕误担雞招骨秦俄升归盘待盖凡扮斤彪哄迅卷犯戴嘞孔瓦宏沉乔执若店俊鹏宙朗寒描T蒸封警洛妮庸露哒龄惯孕蕾邮灯琳禽宠睛恒距井散勇餐撑架至献遇燕抢珍嗎置董坚竟洁扒歉貌录施辈羽络突堡投降妻魏鲜索慧喔例探矮尚泉戒逆灭占察左盗翻令幻姻喵守烂境蒂刺顾诚呸谦退黎钢赤盟潮略骑筑泥贤腐症埃善郑蛮择折层众局O硬渣临袭签荣脾楚颗陵R奏险浩肖仁雯助氏某赖谋齐阴疾醋唠箭勾诞寿责寻域残邦努莎殿抓罪委詹丢P液针辉狮旋惠岭渡坛壁贼访舅犊俺扰岳泪柯显判充往丰刻吻摇朵敬恼誰鑫偏停尺夺煎昆穷葛腾帽宣奉础姜饺轮甘E符迹荷销芬冻昌沈卜寨傅苹咸浮脉厂庙孟策申亦惊薛严企椒嗨痹仪尽瓶戚拖隆忆挥醉豪贾伙晋怖翰婷煤谎船壳鹅幽屏斩启虐荤闪钻概余载胎屈席屋烈刊卢旗饮蜜朴啃吵彗燃烫厚阵驰忧萧龟怒右荒悟戈凭奈宅桶脖踩W拥赫诸蝶绰俱忠疗净润岸摔赚吼垃震胞弱户盲邓谓蔡鸿尊批凉涛佩萄葡扁旺崇酱焦额氧愁赞庭怡苍悔付枚仰乳炎璃玲咖捉琼甄柔瘟朕璐挑股扬砍束畔囧途沃训胃唇涵愛麼虑端喷轨逝碰澳蛇吕即忽填帕陶驾卦锋徽姿奔巧谍湿剁圾G浒均蟹撞磨碧冯卧妃宪奴芝彻樱孵宵毅谐棍咪堵儒疆驱玄亡横疑徒协惨勤扎毁练剪键杭悠厕F葱箱勃绕H透聚竹倩宾匹淘糊兹汪轩棋掌薇奸墨溃凶罚佑茜糗雾炉玻歇猎贫蝎霍鞭柏枝卵晶鼓遥贞迟锦潜催饶御瞌酷崩悦歡嘿給延磁督伴鞋涂喻鹰瀑墓矿浙摆歪沒憋抠肤绩池夹弦县隐巡税且眉刑黛巾翼慕繁潘危坡祥彭坊挨桌腻珊彤逛咧甩漠伏V尘既L裂逊腰壮晴触蜀亭固袁患潭仲扑械悍薯畜删坨闺哇饲虹汇倍昏U甚丈廊侵罩坞敦艳媒咒庚禁尤跨迎咳辐抛损渊臣铜侯桂鼎阁犀旧妙寄琪嫂僧泊鸦沫艘涨幕逃污牡霉欣嘟谜增倾凌犬殖贺卓狐伐乘兼熙滨泼叙墙避铃嬛劈涩瑜琦伪姚叼噗咦驯肌盾蜂姬丘洪嫩姥贯靖赏乒圳款塑析馒煲硕橙怂戳穆预廉拼弯螺裁雀舟梨零牧韦订伍乓辽益啡峪蛙磊睬龊龌佬脆宿寸衡缩飘赔迁享泛宽拾肾柴培陌仇仿跃审楠哺览苯丸搜互猩揉偿熬婶滑蕉振挖另纲娱衔蝴欲茅彼侣尝淹寓廷障宴仗屠倚膜痴迈狸拌萱函卿殊辞莲鹤悄猛筋莹埋灌骄—咏绘旭肺蹦赌免粤崔尸恭坤黃甫盐估粒检闭碑蓉佐窟仓蹈册拳艇隶悬屿厦握蝠蝙慈溶辆奕嵩嗑棉柿辱拽馋妍舔隔掏纵铭肠悉蒋癌肝乃绳砸岩昕羯躁贸附沿陨幅侧伽储芭雁筝蜡讯杏玫瑰唧摘痒铅陕哀爬侦藤孽毙励炫煌售粥榴撤仅舌梯稣捡昊盒诅宥噻秃搂扔秤焖侮幾說冕X帆尖抄袖灾兮轼灿覆叹捕畅衰骆溪奋颁鉴授竞J卑旁巢:蔬龚综纹喉颈漏臊叮痘碉捣賤伱挣擅循供毫妆瓷锁拒豹乙牵颂贪档贴驶沧莓喆潇踢祠蛎琉鲍翘嬷躺锯曦憨羡會苗盈斑窗丧钧刮暑逐炼赐赋驼蝉副葵迫券递唤孝予柱勉谚茹添掐瞧幂啧腚链拟斜辰惟鲸氢碳捷芙闯翁凰倡讽汁荆馅芦吟纱雏契乾萤旦邵仑祈鹦鹉邻祸瑶矛韶愈浦愤钊淑渤哑岂茉咙晗啵覺凑菌庞耀稳掩弥辩薄剂！烹融犹昭敲吾轰淀驳扇茨枣栏裙纽滋婉囊亥蚂浆促桐虽蔚橘粮煜亨抑屑搅肩\"谔沂嘲楞慌挫吨寡硫踏绵冤劝葫戊曰允脂愚陷呈侃购淋削僵霞叽膏浅抬侬邱粪遮垣挠绮韵澈喳來糟尹遛纬胀亏壤涉叭禅庐杠菩肃枫皆暮夕召戌胶聋铺诱侨拆截猿拯祷颖郊阔骏抵赎措逢虾垄冈昵乏诀蹲茄娟诊剥栗茂锷扭個趴話冥轴K拓碱倪禹笛茫忌惩仆〉牲谭稻吒裘貂滕阻债拐豚枉搓扫账蚁洒泣溅扩纺钙陀钰辖谊棕虞贩璇毯诈熔详晒闰袜屯挽薰槽揪兜忒彬喃芯绸膨贡椭Ⅱ喇锄禾蚕浓禄披巷壶栈娲琵琶鸳誓杆婴笼斋陋殷蛛啤叛掘葬搬勋芽醇奠烨玮扶暂沸唔讼逍臂帐甥嗽國渠汀岔锤芋浑機癫噜炅噩喱嫉妒還嚓覃趋耗喀兆硅γ辨疏氨亿恰矩；瑙夷沛匈脊钗苑淮撰贬珀靴驻鲨卉酚拨淇渔厘卤痕绣镖霆咕齿刹襄锡竖徙鳞耕骡跤歧逮匀串惶殉斌鲑菁蒜炜啰愧瑾別鱿瘫講伺嗦嘣涕邹疫羲瞳爵缓胚胁躯缝怨涯稷滥缪搏鸯〈厢肢碍穴违掀绒峨丞裔揭辟－/吞祭鞅阀囚酿褒履蚀砖霜遭疲凝湘蹊梵啪鸽巩俐黍躲筒锐崖铝钮俞贮隋泄檬腥為焕捅崎狙伞霄媛潞咔肛涿衮闫掰經彦罵恁肼吩咐幫郜蕊哩結黒爛幹苟哗挊討厭锈嗝剩垂Q…筹丛晖拱弓萍仍媚冀鹂粘荔丕奢昔．牺焚蕃蓬罢署z娅稍禧慎践蝇靡腹伸酶奎巫窃蜘阮坂颐饨馄丙岗凹绯蹄杉栓馍腺坝瑚懿蔽聂霹雳瘾厅垫返矫罐玟噶啄裕寰殓菘鳖跷靓媽爺嚣瞬聲睾踹磕淼筷汐频携狄狡辅坠俪璧翠鹭堆堪釜棣橡芹】淳竭啸榄橄饥琥抚辫邀粹０滩霖擎赠咽租蝗旨颠阅嗅押朽蜗鄂鳄谣渝腌歼寅痨迄坎栖惑麋塘尧剖闽皂鞍冶浇枕芸寝鞑怦忻懈尴尬點衩溢無睿咿蒽婧嗲躏蹂號棚讓溜孜卸塌歲惧粽涡掠勘璋捐抖蛐絮撬勿饪绽玺颇逸榜薪邺嬉涌【渐哉茵凿哆沁矢漱阎沪鹜焰吝侍缴恢汰Y礁柜蚊绞蛰蛤燥轶盔珑堤钾枯遂厨诏｀麟泌髓砚弊皱馏掷钠崴嗡菡衫韭锥菱膝谡浴崛柠雍睁娥栅廖隧橹晏怯铲忏梓纤刎酗攀砂稚羔槐瘊瑄傀儡嗤蜷阱妫馬帥刨凳槌呱韬呕瞅肏渺猝剔勺錯珉蚬晟昱捶叻紙聽認識侈們堇暧昧璨耿歆趟戀煸問钝陳釋莒侄昼+遵茎羹帘炬婿躬矣棠孺眸渭楷泠踪沐腔辕凄栽镀袄堰挪擒啬箍铸芷侏埔１９挡豫２戛ＦＡ&孚匾蟆甸酵疮妄讳窄滤沦钦斐轿瞑碟槟敛祀凸荫褐匠肴穗劫曝浜莺恺澜浏捞绫瘤臼琢捧阜＂洼檀篱芒肪窦潍辜喘锻嚎炳粱篷町璟恕偲巍簋宛岫涧笙臉捻瑪滾樂芪溧琨疚沢囔遢邋朐啷甭灼跌辦沌玥烩蔫皓龅華脫藐膘盼枰樊嚒肋妁餃拷呃荟燉烬糁飛颚煊灣嗓卞靳誐挞蟦螆蛆愉獨輩钛孰蛔沽這盤稱勍叨眶屮臀幺腩垚仨揽開評畸噎熏惦電噁姸哧嫑泫褶鹑鸨冽朦嗒復尕苕铮惫顏內蔣賊厥網飯谛毽眨嚏朔戎撕询襟樽厄藕烽鸠棺蜃俯袍帼帖骥碾屡椟谬袅黔锲赴佗邸髦俭匕笋棵嚼酥斧觅阙纷冉庵芜亩叠舆=钩枭瞒胳膊帜鞠宦篡镐癞雹鹄阑唳株柄炯淌趾晤碘镑茱抒缸菽绪澎偻佝潼桓%丐芥援旱碓桢颅氯皎荀祯翊孪诃摧纶狭砌螃皿沾蒲洱畴％郡變蜓蜻蠕嫦撼嗜跆绅嗣溉竺萁涅番妥鸵谴睫涣匪嵇勰邢窑歹邂逅嘱晦琛胰墟挝坟倦岚撇锚框淤蛀拦梗顽乍忱弘喋牯泷笹堀暐馥呻趁焯妤嶌葆锣爨褔啾嗷紊亂茬嗄脯忑忐痪謊娴衕摁碜螂樣诡吱峻炝唬懵餓稞萎愣種恬诌鷄對蕩連泇丨衅俑ηⅠ舱氮镓姊镁苷黯匡肆澶悯粟抹鳌贱雎枢簪孑泾桔涓伉枥磺淬鬓镂睦垒瓒莘篌箜泗昙诫匮邑藓剃撩缠鹞吁鹊梢匆聩戬纂琏鬟蘅仞淞挚脍炙柬祺簧ＶＯ涤瞩拄杖暨鳍裹銮洵岬瘁圭翡猕阐哨ＮＢ竿狈琅噪唾睹濡蚩羿幡舶蛾荸荠尉汶濒傣贷*巅抉瀛Ｃ梭徵擞衙啼戟鲟凇菠鸥胭胺稿廿瞿僚磷乞夔烁赦髻苔赳卒疡酌槛矶蔺纣陇滞膛奂麓挟赡炀诲嬅锉疙瘩骤妾嫡氰濛蚓蚯锌℃邳彧笳蓦椰蔗钨迦浣耘笆桩癣坪吏畏烃烷俏檄剿炭毗―釉蟀蟋婢莽铀禺冼钉钞骈熨佟鸢窍缀晃泵桦绎馁锰莆哮梳萸睐珈轲煞榆伶虏陡闵樋籁狩骐蟒柘墅恳飒倔挤蠛痔殺驹獅肽統飙仕煽嵌咻蟑氣垮黝茸旮旯視蹭刃掸裡滿醜碌嘚骁動闸痿痂幔φΔ昴α镶羟氦笺沮褂绦弈胫惘匙钥憾痞颦袱驸笠蓑菰酣桧蠹毋孓浊锵铿竽崂劣嫒鳅羌壑俎啖焉鳗诵猢狲俣夙寐蕴骊醍醐徘徊饴袈裟筵汹腋悴憔噫贻镫偕盅虱迢魁蟠魇谏牤虻汴檐凋扈嫣鹬蚌斥７８ＴＭＩＲＧＥＬ酋垠幢炽傍殄郦羑`隽瞻俘＇•俾搐匿蜍蟾鳝簿嗟幄帷"
+local CIDF_VAL = "#&/1@OOU_dijouvz|¬­°±±²µ¼ÑÓÕÛæèíïÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ"
+
+--====================================================================
+-- ImageCodec · 纯 Lua 5.1 图片解码核心
+--   1) base64 解码
+--   2) inflate（deflate 解压）—— PNG 的 IDAT 需要
+--   3) PNG 解码（颜色类型 0/2/3/4/6，位深 8/16，含 Adam7 之外的所有非隔行情形）
+--   4) JPEG 解码（baseline SOF0，灰度 / YCbCr 3 分量，采样 4:4:4 / 4:2:2 / 4:2:0）
+-- 不依赖任何 C 库；bit 模块存在时自动加速，不存在时走纯算术实现。
+--====================================================================
+local Inflater = {}
+
+--================ 0. bit 操作（迷你 bit 模块，一定存在）=================
+local band    = bit.band
+local bor     = bit.bor
+local bxor    = bit.bxor
+local bnot    = bit.bnot
+local blshift = bit.lshift
+local brshift = bit.rshift
+
+local function pow2(n) return 2 ^ n end
+
+local BitReader = {}
+BitReader.__index = BitReader
+
+function BitReader:new(data, startPos)
+    local o = { data = data, pos = startPos or 1, buf = 0, cnt = 0 }
+    setmetatable(o, self)
+    return o
+end
+
+-- 读取 n 位（n <= 24），位序 LSB first（deflate 用）
+function BitReader:readBits(n)
+    while self.cnt < n do
+        local b = string.byte(self.data, self.pos)
+        if b == nil then return nil end
+        self.pos = self.pos + 1
+        self.buf = self.buf + b * pow2(self.cnt)
+        self.cnt = self.cnt + 8
+    end
+    local q = pow2(n)
+    local v = self.buf % q
+    self.buf = (self.buf - v) / q
+    self.cnt = self.cnt - n
+    return v
+end
+
+-- 读取 1 位，返回 nil / 0 / 1
+function BitReader:readBit()
+    if self.cnt == 0 then
+        local b = string.byte(self.data, self.pos)
+        if b == nil then return nil end
+        self.pos = self.pos + 1
+        self.buf = b
+        self.cnt = 8
+    end
+    local v = self.buf % 2
+    self.buf = (self.buf - v) / 2
+    self.cnt = self.cnt - 1
+    return v
+end
+
+-- 丢弃到字节边界
+function BitReader:alignByte()
+    local drop = self.cnt % 8
+    if drop > 0 then
+        local q = pow2(drop)
+        local v = self.buf % q
+        self.buf = (self.buf - v) / q
+        self.cnt = self.cnt - drop
+    end
+end
+
+-- 高位在前的位读取器（JPEG 用：MSB first）
+local MSBReader = {}
+MSBReader.__index = MSBReader
+
+function MSBReader:new(data, pos)
+    local o = { data = data, pos = pos or 1, buf = 0, cnt = 0 }
+    setmetatable(o, self)
+    return o
+end
+
+-- JPEG 的字节填充：0xFF 后跟 0x00 表示字面量 0xFF
+function MSBReader:_nextByte()
+    local b = string.byte(self.data, self.pos)
+    if b == nil then return nil end
+    self.pos = self.pos + 1
+    if b == 0xFF then
+        local n = string.byte(self.data, self.pos)
+        if n == 0x00 then
+            self.pos = self.pos + 1
+        elseif n == nil then
+            return nil
+        else
+            -- 真正的标记：回退，交由上层处理
+            self.pos = self.pos - 1
+            return nil
+        end
+    end
+    return b
+end
+
+function MSBReader:readBit()
+    if self.cnt == 0 then
+        local b = self:_nextByte()
+        if b == nil then return nil end
+        self.buf = b
+        self.cnt = 8
+    end
+    self.cnt = self.cnt - 1
+    local v = math.floor(self.buf / pow2(self.cnt))
+    self.buf = self.buf % pow2(self.cnt)
+    return v
+end
+
+function MSBReader:readBits(n)
+    local v = 0
+    for _ = 1, n do
+        local b = self:readBit()
+        if b == nil then return nil end
+        v = v * 2 + b
+    end
+    return v
+end
+
+function MSBReader:alignByte()
+    self.buf = 0
+    self.cnt = 0
+end
+
+--================ 3. Canonical Huffman 解码 =================
+-- counts[len] = 该码长的符号数；symbols 按 (码长, 符号值) 排序
+-- 返回 { counts, symbols, minCode, maxCode, firstSymbolIndex }
+local function buildHuffman(lengths)
+    local counts = {}
+    for i = 0, 16 do counts[i] = 0 end
+    for i = 1, #lengths do
+        local l = lengths[i] or 0
+        counts[l] = counts[l] + 1
+    end
+    counts[0] = 0
+
+    local minCode, firstIdx = {}, {}
+    local code, idx = 0, 0
+    for len = 1, 16 do
+        code = code * 2
+        -- firstIdx[len] 必须是 sum(counts[0..len-1])：先记录再累加，
+        -- 不能在同一轮里既加 counts[len-1] 又加 counts[len]，否则下一轮会重复计一次
+        firstIdx[len] = idx
+        minCode[len] = code
+        idx = idx + counts[len]
+        code = code + counts[len]
+    end
+
+    local symbols = {}
+    for sym = 0, #lengths - 1 do
+        local l = lengths[sym + 1] or 0
+        if l > 0 then
+            -- 先取当前槽位再自增：firstIdx 初始即该码长的首个槽位（0-based）
+            symbols[firstIdx[l]] = sym
+            firstIdx[l] = firstIdx[l] + 1
+        end
+    end
+
+    return { counts = counts, symbols = symbols, minCode = minCode, firstIdxSaved = firstIdx }
+end
+
+-- 用 LSB-first 读取器解码（inflate）
+local function huffDecodeLSB(br, h)
+    local code, first, index = 0, 0, 0
+    for len = 1, 16 do
+        local b = br:readBit()
+        if b == nil then return nil end
+        code = code * 2 + b          -- 先读到的位是码字的高位
+        local count = h.counts[len]
+        if code - first < count then
+            return h.symbols[index + (code - first)]
+        end
+        index = index + count
+        first = (first + count) * 2
+        -- 注意：不能再 code = code * 2。位已在 code = code*2 + b 时左移过，
+        -- 再左移一次会让每轮的位权翻倍，码字永远匹配不上。
+    end
+    return nil
+end
+
+-- 用 MSB-first 读取器解码（JPEG）
+local function huffDecodeMSB(br, h)
+    local code, first, index = 0, 0, 0
+    for len = 1, 16 do
+        local b = br:readBit()
+        if b == nil then return nil end
+        code = code * 2 + b
+        local count = h.counts[len]
+        if code - first < count then
+            return h.symbols[index + (code - first)]
+        end
+        index = index + count
+        first = (first + count) * 2
+        -- 注意：不能再 code = code * 2。位已在 code = code*2 + b 时左移过，
+        -- 再左移一次会让每轮的位权翻倍，码字永远匹配不上。
+    end
+    return nil
+end
+
+--================ 4. inflate（deflate 解压）=================
+local LBASE = { 3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258 }
+local LEXT  = { 0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0 }
+local DBASE = { 1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577 }
+local DEXT  = { 0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13 }
+
+local FIXED_LIT, FIXED_DIST
+local function initFixed()
+    if FIXED_LIT then return end
+    local l = {}
+    for i = 1, 144 do l[i] = 8 end
+    for i = 145, 256 do l[i] = 9 end
+    for i = 257, 280 do l[i] = 7 end
+    for i = 281, 288 do l[i] = 8 end
+    FIXED_LIT = buildHuffman(l)
+    local d = {}
+    for i = 1, 30 do d[i] = 5 end
+    FIXED_DIST = buildHuffman(d)
+end
+
+local DLENS_ORDER = { 17,18,19,1,9,8,10,7,11,6,12,5,13,4,14,3,15,2,16,1 }
+
+-- 解压 deflate 数据流；返回字符串
+local CLEN_ORDER = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15}
+
+-- 读取动态霍夫曼树的码长并构建字面量树/距离树
+-- 返回 true, litTree, distTree 或 false, errmsg
+local function readDynamicTrees(br)
+    local hlit = br:readBits(5)
+    local hdist = br:readBits(5)
+    local hclen = br:readBits(4)
+    if hlit == nil or hdist == nil or hclen == nil then
+        return false, "动态树头读取失败"
+    end
+    hlit = hlit + 257
+    hdist = hdist + 1
+    hclen = hclen + 4
+
+    local clen = {}
+    for i = 1, 19 do clen[i] = 0 end
+    for i = 1, hclen do
+        local v = br:readBits(3)
+        if v == nil then return false, "码长读取失败" end
+        clen[CLEN_ORDER[i] + 1] = v
+    end
+    local clTree = buildHuffman(clen)
+    if not clTree then return false, "码长树构建失败" end
+
+    local lengths = {}
+    local index = 0
+    while index < hlit + hdist do
+        local sym = huffDecodeLSB(br, clTree)
+        if sym == nil then return false, "码长符号解码失败" end
+        local symlen, rep
+        if sym < 16 then
+            symlen = sym
+            rep = 1
+        elseif sym == 16 then
+            if index < 1 then return false, "码长重复 16 缺少前驱" end
+            symlen = lengths[index] or 0
+            rep = 3 + (br:readBits(2) or 0)
+        elseif sym == 17 then
+            symlen = 0
+            rep = 3 + (br:readBits(3) or 0)
+        else
+            symlen = 0
+            rep = 11 + (br:readBits(7) or 0)
+        end
+        for _ = 1, rep do
+            if index >= hlit + hdist then return false, "码长数据溢出" end
+            index = index + 1
+            lengths[index] = symlen
+        end
+    end
+
+    local litL, distL = {}, {}
+    for i = 1, hlit do litL[i] = lengths[i] or 0 end
+    for i = 1, hdist do distL[i] = lengths[hlit + i] or 0 end
+    local lt = buildHuffman(litL)
+    local dt = buildHuffman(distL)
+    if not lt then return false, "字面量树构建失败" end
+    if not dt then return false, "距离树构建失败" end
+    return true, lt, dt
+end
+
+
+function Inflater.inflate(data, startPos)
+    initFixed()
+    local br = BitReader:new(data, startPos or 1)
+
+    -- 滑动窗口输出缓冲：buf 保留最近 KEEP 字节供 dist 回溯，
+    -- 超出的部分 flush 进 chunks，避免大图一次性占用巨量内存。
+    local WINDOW, KEEP = 131072, 65536
+    local chunks, nChunks = {}, 0
+    local buf = ""
+    local flushed = 0
+
+    local function push(s)
+        if s == "" then return end
+        buf = buf .. s
+        if #buf > WINDOW then
+            local drop = #buf - KEEP
+            nChunks = nChunks + 1
+            chunks[nChunks] = string.sub(buf, 1, drop)
+            buf = string.sub(buf, drop + 1)
+            flushed = flushed + drop
+        end
+    end
+
+    -- 取全局位置 gpos 起最多 len 字节（只从当前窗口内取）
+    local function copyRange(gpos, len)
+        local p = gpos - flushed
+        if p < 1 then return "" end
+        if p > #buf then return "" end
+        return string.sub(buf, p, p + len - 1)
+    end
+
+    local last = 0
+    while last == 0 do
+        local b = br:readBit()
+        if b == nil then break end
+        last = b
+        local btype = br:readBits(2)
+        if btype == nil then break end
+
+        if btype == 0 then
+            -- 未压缩块
+            br:alignByte()
+            local len = string.byte(data, br.pos)
+            local len2 = string.byte(data, br.pos + 1)
+            if len == nil or len2 == nil then break end
+            len = len + len2 * 256
+            br.pos = br.pos + 4
+            if br.pos + len - 1 > #data then break end
+            push(string.sub(data, br.pos, br.pos + len - 1))
+            br.pos = br.pos + len
+
+        elseif btype == 1 or btype == 2 then
+            local litTree, distTree
+            if btype == 1 then
+                litTree, distTree = FIXED_LIT, FIXED_DIST
+            else
+                local ok, l, d = readDynamicTrees(br)
+                if not ok then return nil, l end
+                litTree, distTree = l, d
+            end
+
+            while true do
+                local sym = huffDecodeLSB(br, litTree)
+                if sym == nil then return nil, "字面量解码失败" end
+                if sym < 256 then
+                    push(string.char(sym))
+                elseif sym == 256 then
+                    break
+                else
+                    local li = sym - 257 + 1
+                    if li < 1 or li > 29 then return nil, "非法长度码 " .. tostring(sym) end
+                    local length = LBASE[li] + (br:readBits(LEXT[li]) or 0)
+                    local dsym = huffDecodeLSB(br, distTree)
+                    if dsym == nil then return nil, "距离解码失败" end
+                    if dsym > 29 then return nil, "非法距离码 " .. tostring(dsym) end
+                    local dist = DBASE[dsym + 1] + (br:readBits(DEXT[dsym + 1]) or 0)
+                    if dist < 1 then return nil, "非法距离 0" end
+
+                    local total = flushed + #buf
+                    local src = total - dist + 1
+                    if src < 1 then return nil, "距离超出已输出数据" end
+                    -- 先从历史窗口取能取到的部分
+                    local avail = total - src + 1
+                    local take = (length < avail) and length or avail
+                    local res = copyRange(src, take)
+                    if #res < take then
+                        res = res .. string.rep("\0", take - #res)
+                    end
+                    -- 重叠部分（dist < length）由自身循环补齐
+                    while #res < length do
+                        local need = length - #res
+                        res = res .. string.sub(res, 1, need)
+                    end
+                    push(res)
+                end
+            end
+        else
+            return nil, "非法的 deflate 块类型 3"
+        end
+    end
+
+    nChunks = nChunks + 1
+    chunks[nChunks] = buf
+    return table.concat(chunks, "", 1, nChunks)
+end
+
+
+--====================================================================
+-- 迷你中文对话模型 · 推理引擎
+--   存储：语料分片压缩后存二维表（zlib + Base85）
+--   检索：字符 bigram + 单字 IDF 加权余弦，按桶加载
+--   上下文：按 sessionId 维护多轮
+--====================================================================
+
+--==================== Base85 解码 ====================
+local B85 = {}
+do
+    for i = 0, 84 do
+        B85[string.char(i + 0x21)] = i
+    end
+end
+
+local function b85Decode(s)
+    if type(s) ~= "string" or #s == 0 then return "" end
+    local out = {}
+    local n = #s
+    local i = 1
+    while i <= n do
+        if string.sub(s, i, i) == "z" then
+            out[#out + 1] = "\0\0\0\0"
+            i = i + 1
+        else
+            local v = 0
+            for k = 0, 4 do
+                local ch = string.sub(s, i + k, i + k)
+                local idx = (ch ~= "" and B85[ch]) or 0
+                v = v * 85 + idx
+            end
+            i = i + 5
+            local b1 = math.floor(v / 16777216) % 256
+            local b2 = math.floor(v / 65536) % 256
+            local b3 = math.floor(v / 256) % 256
+            local b4 = v % 256
+            out[#out + 1] = string.char(b1, b2, b3, b4)
+        end
+    end
+    return table.concat(out)
+end
+
+--==================== 运行时基础 ====================
+-- 环境前提（已确认）：
+--   bit 模块一定存在；os 有 date / time / timeMs，其中 timeMs 返回毫秒。
+--   os 没有 clock，禁止使用。
+
+-- 毫秒计时（os.timeMs 即毫秒，直接用）
+local function nowMs()
+    return os.timeMs()
+end
+
+-- 秒级时间戳（会话时间戳 / 随机种子）
+local function nowSec()
+    return os.time()
+end
+
+-- 随机数：xorshift32，用 bit 模块实现。
+-- 注意 Lua 5.1 没有位运算符，"x ~ y" 会直接编译报错
+-- （引擎报 "')' expected near '~'"），必须用 bit.bxor。
+local _rngState = 2463534242
+local function seedRandom(n)
+    if type(n) == "number" and n > 0 then
+        _rngState = (n % 2147483647)
+        if _rngState <= 0 then _rngState = 1 end
+    end
+end
+local function randInt(n)
+    if n <= 1 then return 1 end
+    local x = _rngState
+    x = bit.bxor(x, bit.lshift(x, 13))
+    x = bit.bxor(x, bit.rshift(x, 17))
+    x = bit.bxor(x, bit.lshift(x, 5))
+    _rngState = (x % 2147483647)
+    if _rngState <= 0 then _rngState = 1 end
+    return (_rngState % n) + 1
+end
+
+
+--==================== 字符切分 ====================
+-- 按 UTF-8 切出单字（与 Python 侧 to_chars 一致）
+local function toChars(s)
+    local out = {}
+    local n = #s
+    local i = 1
+    while i <= n do
+        local b = string.byte(s, i)
+        if b < 0x80 then
+            out[#out + 1] = string.sub(s, i, i)
+            i = i + 1
+        elseif b >= 0xF0 then
+            out[#out + 1] = string.sub(s, i, i + 3); i = i + 4
+        elseif b >= 0xE0 then
+            out[#out + 1] = string.sub(s, i, i + 2); i = i + 3
+        elseif b >= 0xC0 then
+            out[#out + 1] = string.sub(s, i, i + 1); i = i + 2
+        else
+            i = i + 1
+        end
+    end
+    return out
+end
+
+--==================== 单字 IDF 表 ====================
+-- CIDF_TXT[k] 对应 CIDF_VAL[k]；VAL 越小 = 越常见（1 表示极高频虚词）
+local CIDF = {}
+do
+    local txt, val = CIDF_TXT, CIDF_VAL
+    local ti, vi = 1, 1
+    local nT, nV = #txt, #val
+    while ti <= nT and vi <= nV do
+        local b = string.byte(txt, ti)
+        local len = 1
+        if b >= 0xF0 then len = 4 elseif b >= 0xE0 then len = 3 elseif b >= 0xC0 then len = 2 end
+        CIDF[string.sub(txt, ti, ti + len - 1)] = string.byte(val, vi)
+        ti = ti + len
+        vi = vi + 1
+    end
+end
+
+local DEFAULT_W = 120   -- 未登录字给中等权重
+
+local function charW(c)
+    return CIDF[c] or DEFAULT_W
+end
+
+--==================== token 提取（单字 + bigram）====================
+local function tokens(s)
+    local cs = toChars(s)
+    local t = {}
+    local seen = {}
+    local n = #cs
+    for i = 1, n do
+        local c = cs[i]
+        if not seen[c] then seen[c] = true; t[#t + 1] = c end
+    end
+    for i = 1, n - 1 do
+        local g = cs[i] .. cs[i + 1]
+        if not seen[g] then seen[g] = true; t[#t + 1] = g end
+    end
+    return t, cs
+end
+
+-- token 权重：单字用 IDF；bigram 用两字 IDF 之和 * 1.5（相邻字共现更强信号）
+local function tokenW(tok)
+    local a = string.sub(tok, 1, 3)
+    if #tok <= 3 then
+        return charW(tok) / 100
+    end
+    local cs = toChars(tok)
+    if #cs < 2 then return charW(tok) / 100 end
+    return (charW(cs[1]) + charW(cs[2])) / 100 * 1.5
+end
+
+--==================== 桶选择 ====================
+local NBUCKET = 256
+
+local function bucketHash(tok)
+    local h = 0
+    for i = 1, #tok do
+        h = (h * 131 + string.byte(tok, i)) % NBUCKET
+    end
+    return h
+end
+
+-- 挑 IDF 最高的若干个 token 作为分桶依据（去重后取前 K 个桶）
+local function pickBuckets(toks, k)
+    local scored = {}
+    for i, t in ipairs(toks) do
+        scored[i] = { w = tokenW(t), h = bucketHash(t), t = t }
+    end
+    table.sort(scored, function(a, b) return a.w > b.w end)
+    local out, seen = {}, {}
+    for i = 1, #scored do
+        local h = scored[i].h
+        if not seen[h] then
+            seen[h] = true
+            out[#out + 1] = h
+            if #out >= k then break end
+        end
+    end
+    return out
+end
+
+--==================== 诊断输出 ====================
+-- 目的：出问题时把关键状态一次性打到日志里，方便直接截图排查。
+-- 每行都带 [LLM-D] 前缀，日志里搜这个前缀就能看全。
+local function safePrint(msg)
+    local ok = pcall(function()
+        -- 迷你日志对超长行不友好，截断到 200 字符
+        local m = tostring(msg)
+        if #m > 200 then m = string.sub(m, 1, 197) .. "..." end
+        print(m)
+    end)
+end
+
+local function D(msg)
+    safePrint("[LLM-D] " .. tostring(msg))
+end
+
+-- 桶加载失败原因：bid -> 原因串
+local BUCKET_FAIL = {}
+
+--==================== 二维表读取 ====================
+-- 取一行里的"数据字段"。
+-- 真实二维表导入后每行有多列：我们导出的 CSV 是 (行号, 内容, 空)，
+-- 所以 row[1] 是行号 "1"，row[2] 才是内容。之前只取 row[1]，
+-- 拿到一堆行号去 Base85 解码，全是垃圾 → inflate 失败 → 所有桶加载失败
+-- → 每句话都走兜底。测试 stub 是单列所以没暴露。
+-- 这里做通用取值：字段多于 1 个时，跳过纯数字（行号），取最长的字符串。
+local function pickField(row)
+    if type(row) ~= "table" then return nil end
+    local n = #row
+    if n == 0 then return nil end
+    if n == 1 then
+        return type(row[1]) == "string" and row[1] or nil
+    end
+    local best, bestLen = nil, -1
+    local firstStr = nil
+    for i = 1, n do
+        local v = row[i]
+        if type(v) == "string" then
+            if not firstStr then firstStr = v end
+            -- 纯数字且很短 → 行号，跳过
+            local isNum = (string.match(v, "^%s*%-?%d+%s*$") ~= nil) and #v <= 12
+            if not isNum and #v > bestLen then
+                best, bestLen = v, #v
+            end
+        end
+    end
+    if best then return best end
+    return firstStr
+end
+
+
+local TABLE_CACHE = {}     -- tableId -> {rows}
+
+local function readTable(tid)
+    if TABLE_CACHE[tid] then return TABLE_CACHE[tid] end
+    local ok, rows = pcall(function()
+        return Data.Table:GetAllValue(tid, nil)
+    end)
+    if not ok or type(rows) ~= "table" then
+        TABLE_CACHE[tid] = false
+        return false
+    end
+    TABLE_CACHE[tid] = rows
+    return rows
+end
+
+--==================== 取二维表 ID（防 nil 崩溃）====================
+
+-- 内置默认 ID：即使组件属性一个都没生效，也能直接跑。
+-- 实测踩过：Mini.Array 类型的组件属性在某些版本里根本不会写进 Script，
+-- 运行时 Script.tableIds 就是 nil，一索引就抛
+--   "attempt to index field 'tableIds' (a nil value)"
+-- 整个对话链崩掉。所以这里不依赖属性，内置一份兜底。
+local DEFAULT_IDS = {
+    "v7692856137548737533110822",
+    "v7692856244922919933110824",
+    "v7692856300757494781110826",
+    "v7692856339412200445110828",
+    "v7692856378066906109110830",
+    "v7692856421016579069110832",
+    "v7692856459671284733110834",
+    "v7692856502620957693110836",
+    "v7692856545570630653110838",
+    "v7692856575635401725110840",
+    "v7692856601405205501110842",
+    "v7692856631469976573110844",
+    "v7692856661534747645110846",
+    "v7692856691599518717110848"
+}
+
+local RUNTIME_IDS = nil     -- SetTableIds 运行时覆盖
+local IDS_SOURCE  = "未解析" -- 记录本次用的是哪一路
+local IDS_LOGGED  = false
+
+-- 逗号分隔字符串 -> 数组（兼容中文逗号、分号、空格、换行）
+local function splitIds(str)
+    local out = {}
+    for part in string.gmatch(str, "[^,，;；%s]+") do
+        local v = string.gsub(part, "^%s+", "")
+        v = string.gsub(v, "%s+$", "")
+        if v ~= "" then out[#out + 1] = v end
+    end
+    return out
+end
+
+-- 尝试把"数组包装对象"拆成 Lua 表（部分版本数组属性是 userdata 包装）
+-- 数组属性可能是：普通 Lua 表 / 带 values 的包装 / userdata(元表 __index)。
+-- 三种都要能拆出 {字符串,...}。
+local function unwrapArray(v)
+    if v == nil then return nil end
+    -- A. 普通表且有元素
+    if type(v) == "table" and #v > 0 then return v end
+    -- B. 包装对象 {values=...}
+    if type(v) == "table" or type(v) == "userdata" then
+        for _, k in ipairs({ "values", "data", "list", "arr", "_values", "items" }) do
+            local ok, sub = pcall(function() return v[k] end)
+            if ok and type(sub) == "table" and #sub > 0 then return sub end
+        end
+    end
+    -- C. userdata / 元表数组：按 1..N 逐个取字符串
+    --    （Mini.Array 构造出的对象常走这条路，#v 取不到但 [1][2] 能取）
+    if type(v) == "table" or type(v) == "userdata" then
+        local out = {}
+        for i = 1, 64 do
+            local ok, item = pcall(function() return v[i] end)
+            if not ok or item == nil then break end
+            if type(item) == "string" or type(item) == "number" then
+                out[#out + 1] = tostring(item)
+            else
+                break
+            end
+        end
+        if #out > 0 then return out end
+    end
+    return nil
+end
+
+
+-- 组件实例引用。OnStart 里保存 self。
+-- 关键（实测根因）：组件属性是写在【实例】上的，不是写在模板表 Script 上。
+-- 官方文档一律用 self.xxx 访问属性。之前只读 Script.tableIds，
+-- 在属性没写进模板表的版本里就是 nil，一索引就抛
+--   "attempt to index field 'tableIds' (a nil value)"。
+-- self 通常带元表指向 Script，所以读 self 同时覆盖
+-- "属性在实例上"和"属性在模板上"两种情况，是最优解。
+local COMPONENT_SELF = nil
+
+-- 统一属性读取：实例优先，回退模板表 Script。
+-- 组件属性实例化后写在【实例 self】上（官方文档一律 self.xxx），
+-- 但调试函数里若直接写 Script.xxx 就会读到 nil，打印出一堆 nil 让人误判。
+local function getProp(name)
+    local self_ = COMPONENT_SELF
+    if self_ ~= nil then
+        local ok, v = pcall(function() return self_[name] end)
+        if ok and v ~= nil then return v end
+    end
+    local ok2, v2 = pcall(function() return Script[name] end)
+    if ok2 and v2 ~= nil then return v2 end
+    return nil
+end
+local function getNumProp(name, dft)
+    local v = tonumber(getProp(name))
+    if v == nil then return dft end
+    return v
+end
+
+-- 绑定组件实例：所有 Script: 方法开头调一次，保证 COMPONENT_SELF 有效。
+local function bindSelf(s)
+    if s ~= nil then COMPONENT_SELF = s end
+end
+
+-- 统一解析 14 个二维表 ID。优先级：
+--   1) 运行时 SetTableIds 设的
+--   2) 组件实例 self 上的属性（官方标准访问方式）
+--   3) 模板表 Script 上的属性（兼容旧行为）
+--   4) 内置默认值
+-- 无论走哪条都返回可用数组，绝不返回 nil。
+local function getIds()
+    if RUNTIME_IDS and #RUNTIME_IDS > 0 then
+        IDS_SOURCE = "运行时SetTableIds(" .. #RUNTIME_IDS .. ")"
+        return RUNTIME_IDS
+    end
+    local self_ = COMPONENT_SELF
+    if self_ ~= nil then
+        -- 字符串属性
+        local okS, raw = pcall(function() return self_.tableIdsText end)
+        if okS and type(raw) == "string" and raw ~= "" then
+            local t = splitIds(raw)
+            if #t > 0 then
+                IDS_SOURCE = "实例属性tableIdsText(" .. #t .. ")"
+                return t
+            end
+        end
+        if okS and type(raw) == "table" then
+            local t = unwrapArray(raw)
+            if t and #t > 0 then
+                IDS_SOURCE = "实例属性tableIdsText(表" .. #t .. ")"
+                return t
+            end
+        end
+        -- 数组属性（Mini.Array，可能是 userdata 包装）
+        local okA, arr = pcall(function() return self_.tableIds end)
+        if okA and arr ~= nil then
+            local t = unwrapArray(arr)
+            if t and #t > 0 then
+                IDS_SOURCE = "实例属性tableIds(数组" .. #t .. ")"
+                return t
+            end
+        end
+    end
+    local raw = rawget(Script, "tableIdsText")
+    if type(raw) == "string" and raw ~= "" then
+        local t = splitIds(raw)
+        if #t > 0 then
+            IDS_SOURCE = "属性tableIdsText(" .. #t .. ")"
+            return t
+        end
+    end
+    if type(raw) == "table" then
+        local t = unwrapArray(raw)
+        if t and #t > 0 then
+            IDS_SOURCE = "属性tableIdsText(表" .. #t .. ")"
+            return t
+        end
+    end
+    local arr = rawget(Script, "tableIds")
+    if arr ~= nil then
+        local t = unwrapArray(arr)
+        if t and #t > 0 then
+            IDS_SOURCE = "属性tableIds(数组" .. #t .. ")"
+            return t
+        end
+    end
+    IDS_SOURCE = "内置默认(14)"
+    return DEFAULT_IDS
+end
+
+local TABLE_ID_NIL_LOGGED = false
+local function getTableId(idx)
+    local ids = getIds()
+    local v = ids[idx]
+    if v == nil and not TABLE_ID_NIL_LOGGED then
+        TABLE_ID_NIL_LOGGED = true
+        D("【缺ID】第 " .. idx .. " 个为空，当前来源=" .. IDS_SOURCE ..
+          " 共" .. #ids .. "个。需要 14 个：llm_data_1 .. llm_data_14")
+        D("  -> 可用开放函数 SetTableIds(\"id1,id2,...\") 直接指定")
+    end
+    return v
+end
+
+-- 运行时指定二维表 ID（绕过组件属性，排障用）
+function Script:SetTableIds(text)
+    bindSelf(self)
+    if type(text) ~= "string" or text == "" then
+        D("SetTableIds: 参数为空，未生效")
+        return "参数为空"
+    end
+    local t = splitIds(text)
+    if #t == 0 then return "解析出0个ID" end
+    RUNTIME_IDS = t
+    IDS_SOURCE = "运行时SetTableIds(" .. #t .. ")"
+    TABLE_CACHE = {}
+    BUCKETS = {}
+    BUCKET_FAIL = {}
+    TABLE_ID_NIL_LOGGED = false
+    D("SetTableIds 生效: " .. #t .. " 个 -> " .. t[1] .. " ... " .. t[#t])
+    return "已设置 " .. #t .. " 个ID"
+end
+
+function Script:GetTableIds()
+    bindSelf(self)
+    local ids = getIds()
+    local parts = {}
+    for i = 1, math.min(#ids, 16) do parts[#parts + 1] = tostring(ids[i]) end
+    D("[LLM-D] 当前ID来源=" .. IDS_SOURCE .. " 共" .. #ids .. "个")
+    return "来源=" .. IDS_SOURCE .. "\n" .. table.concat(parts, "\n")
+end
+
+
+--==================== 桶加载与缓存 ====================
+local BUCKETS = {}     -- bucketId -> { {q,a}, ... }
+local NO_HAN = false
+local BUCKET_LOADING = false
+
+local function loadBucket(bid)
+    if BUCKETS[bid] ~= nil then return BUCKETS[bid] end
+    local m = MANIFEST[bid]
+    if not m then
+        BUCKETS[bid] = false
+        BUCKET_FAIL[bid] = "manifest 无此桶"
+        return false
+    end
+    local ti, r0, r1 = m[1], m[2], m[3]
+    local tid = getTableId(ti + 1)
+    if not tid then
+        BUCKETS[bid] = false
+        BUCKET_FAIL[bid] = "tableIds[" .. tostring(ti + 1) .. "] 不存在"
+        return false
+    end
+    local rows = readTable(tid)
+    if not rows then
+        BUCKETS[bid] = false
+        BUCKET_FAIL[bid] = "读表失败 id=" .. tostring(tid)
+        return false
+    end
+    -- 数据行偏移：分片自带 "LLM1|" 表头时从 1 开始，否则从 0 开始。
+    -- 不写死，避免导入方式不同导致整段数据错位。
+    local off = 1
+    local h0 = rows[1] and pickField(rows[1])
+    if type(h0) == "string" and string.sub(h0, 1, 5) == "LLM1|" then off = 2 end
+    local chunks = {}
+    for r = r0 + off, r1 + off - 1 do
+        local row = rows[r]
+        local v = row and pickField(row)
+        if v then
+            chunks[#chunks + 1] = v
+        end
+    end
+    local b85 = table.concat(chunks)
+    if #b85 == 0 then
+        BUCKETS[bid] = false
+        BUCKET_FAIL[bid] = "取到0个字符(表" .. tostring(tid) .. " 行" ..
+            tostring(r0 + off) .. "-" .. tostring(r1 + off - 1) .. " 共" .. tostring(#rows) .. "行)"
+        return false
+    end
+    local ok2, raw = pcall(function()
+        return Inflater.inflate(b85Decode(b85), 3)
+    end)
+    if not ok2 then
+        BUCKETS[bid] = false
+        BUCKET_FAIL[bid] = "inflate异常 " .. tostring(raw)
+        return false
+    end
+    if not raw or #raw == 0 then
+        BUCKETS[bid] = false
+        BUCKET_FAIL[bid] = "inflate返回空(取到" .. tostring(#b85) .. "字符, 首20=" ..
+            string.sub(b85, 1, 20) .. ")"
+        return false
+    end
+    -- 解析：条目用 \2 分隔，Q 与 A 用 \1 分隔
+    local list = {}
+    for entry in string.gmatch(raw, "[^\2]+") do
+        local p = string.find(entry, "\1", 1, true)
+        if p then
+            list[#list + 1] = { string.sub(entry, 1, p - 1), string.sub(entry, p + 1) }
+        end
+    end
+    BUCKETS[bid] = list
+    return list
+end
+
+--==================== 打分检索 ====================
+-- 余弦相似度：matchW / (sqrt(qW) * sqrt(cW))
+local function scorePair(qTok, qW, candTok, candW)
+    local inner = {}
+    local match = 0
+    local hit = 0
+    for i, t in ipairs(candTok) do inner[t] = candW[i] end
+    for i, t in ipairs(qTok) do
+        local w = inner[t]
+        if w then
+            match = match + (qW[i] < w and qW[i] or w)
+            hit = hit + 1
+        end
+    end
+    if match <= 0 then return 0, 0 end
+    local sq, sc = 0, 0
+    for i = 1, #qW do sq = sq + qW[i] * qW[i] end
+    for i = 1, #candW do sc = sc + candW[i] * candW[i] end
+    if sq <= 0 or sc <= 0 then return 0, 0 end
+    return match / (math.sqrt(sq) * math.sqrt(sc)), hit / #qTok
+end
+
+local function buildTok(q)
+    local t = tokens(q)
+    local w = {}
+    for i, x in ipairs(t) do w[i] = tokenW(x) end
+    return t, w
+end
+
+--==================== 候选分词结果复用 ====================
+-- 原来每次检索都要给桶里几百条候选各做一次分词，这是最大的一笔浪费
+-- （同一个桶被反复查询时，分词结果完全一样）。这里按候选问句缓存。
+-- 命中率很高：热门桶的候选会反复参与打分。
+local TOKEN_CACHE = {}       -- 候选问句 -> {tok, w}
+local TOKEN_ORDER = {}
+local TOKEN_N = 0
+local TOKEN_MAX = 20000
+
+local function tokOf(s)
+    local c = TOKEN_CACHE[s]
+    if c then return c[1], c[2] end
+    local t, w = buildTok(s)
+    if TOKEN_MAX > 0 then
+        TOKEN_CACHE[s] = { t, w }
+        TOKEN_ORDER[#TOKEN_ORDER + 1] = s
+        TOKEN_N = TOKEN_N + 1
+        while TOKEN_N > TOKEN_MAX do
+            local old = table.remove(TOKEN_ORDER, 1)
+            if old then TOKEN_CACHE[old] = nil end
+            TOKEN_N = TOKEN_N - 1
+            if #TOKEN_ORDER == 0 then break end
+        end
+    end
+    return t, w
+end
+
+--==================== 资料库（用户自定义 · 压缩式储存）====================
+-- 来源：组件属性 knowledgeBase（字符串数组，maxNum=9999）+ kbText（换行分隔文本）
+--
+-- 条目格式："问法1|问法2|...|答案"
+--   · 最后一个竖线后面是【答案】，前面全是【问法】——同一答案可以登记多种说法，
+--     "服务器几点开服|服务器什么时候开|晚上 8 点开服"，换个问法照样命中。
+--   · 只写一个竖线就是普通问答；不含竖线则整条当答案，取前 12 字做问法。
+--
+-- 自动合并（构建时）：
+--   · 答案相同 -> 问法合并到同一条，答案只存一份
+--   · 问法相同 -> 答案合并（\3 分隔，命中时轮换，跟内置语料一个逻辑）
+--
+-- 打分：加权重叠系数 match / min(sumQ, sumC)，不是余弦。
+--   实测「换个说法问」的场景：重叠系数正例均分 0.620、负例 0.069；
+--   余弦只有 0.127 / 0.012——分数低到根本过不了门槛，这是换问法命中不了的根因。
+--   短句共享的字本来就少，余弦的分母（两边长度乘积开方）会把分数压垮。
+--
+-- 压缩：汉字 bigram 频次 >=2 取 top96 建词典，命中 bigram 从 6 字节压到 2 字节。
+--   中文资料实测省 41%(10条) / 55%(50条) / 57%(200条)，解压纯查表，比 inflate 快。
+local KB_ESC = "\1"
+local KB_DICT_MAX = 96
+local KB_DELTA_MAX = 64        -- 增量条目攒到这个数才触发一次全量重建
+local KB_ITEMS = nil           -- {{qs={问法..}, a=答案}, ..}  来自属性/持久化
+local KB_DELTA = nil           -- 运行时 AddKnowledge 追加的条目（未压缩）
+local KB_AIDX = nil            -- 答案 -> 条目下标（合并用）
+local KB_QIDX = nil            -- 问法 -> 条目下标（合并用）
+local KB_BLOB = nil
+local KB_RAW_BYTES = 0
+local KB_ZIP_BYTES = 0
+local KB_DICT_N = 0
+local KB_QN = 0                -- 问法总数
+
+-- ---------- 收集原始行 ----------
+local function kbCollect()
+    local list = {}
+    local arr = nil
+    local self_ = COMPONENT_SELF
+    if self_ ~= nil then
+        local ok, v = pcall(function() return self_.knowledgeBase end)
+        if ok and v ~= nil then arr = v end
+    end
+    if arr == nil then arr = rawget(Script, "knowledgeBase") end
+    local t = unwrapArray(arr)
+    if t then
+        for i = 1, #t do
+            local x = tostring(t[i] or "")
+            x = string.gsub(x, "^%s+", "")
+            x = string.gsub(x, "%s+$", "")
+            if x ~= "" then list[#list + 1] = x end
+        end
+    end
+    local txt = nil
+    if self_ ~= nil then
+        local ok, v = pcall(function() return self_.kbText end)
+        if ok and type(v) == "string" then txt = v end
+    end
+    if txt == nil then txt = rawget(Script, "kbText") end
+    if type(txt) == "string" and txt ~= "" then
+        for kblraw in string.gmatch(txt, "[^\r\n]+") do
+            local kbline = string.gsub(kblraw, "^%s+", "")
+            kbline = string.gsub(kbline, "%s+$", "")
+            if kbline ~= "" then list[#list + 1] = kbline end
+        end
+    end
+    return list
+end
+
+-- ---------- 解析一行 -> 问法表 + 答案 ----------
+local function kbParseLine(raw)
+    if type(raw) ~= "string" or raw == "" then return nil end
+    local fields = {}
+    local pos = 1
+    while true do
+        local a = string.find(raw, "|", pos, true)
+        if a then
+            fields[#fields + 1] = string.sub(raw, pos, a - 1)
+            pos = a + 1
+        else
+            fields[#fields + 1] = string.sub(raw, pos)
+            break
+        end
+    end
+    -- 去掉首尾空白，丢掉空字段
+    local clean = {}
+    for i = 1, #fields do
+        local f = string.gsub(fields[i], "^%s+", "")
+        f = string.gsub(f, "%s+$", "")
+        if f ~= "" then clean[#clean + 1] = f end
+    end
+    if #clean == 0 then return nil end
+    if #clean == 1 then
+        -- 没有竖线：整条当答案，取前 12 字做问法
+        local a = clean[1]
+        local ch = toChars(a)
+        local tt = {}
+        for i = 1, math.min(12, #ch) do tt[i] = ch[i] end
+        return { table.concat(tt) }, a
+    end
+    local ans = clean[#clean]
+    local qs = {}
+    for i = 1, #clean - 1 do qs[#qs + 1] = clean[i] end
+    return qs, ans
+end
+
+-- ---------- 合并：答案相同并问法，问法相同并答案 ----------
+local function kbMerge(list)
+    local items, aidx, qidx = {}, {}, {}
+    for i = 1, #list do
+        local qs, a = kbParseLine(list[i])
+        if qs and a and a ~= "" then
+            local ai = aidx[a]
+            if ai then
+                -- 答案已存在：把问法并进去（去重）
+                local it = items[ai]
+                local seen = {}
+                for _, q in ipairs(it.qs) do seen[q] = true end
+                for _, q in ipairs(qs) do
+                    if not seen[q] then
+                        seen[q] = true
+                        it.qs[#it.qs + 1] = q
+                        if qidx[q] == nil then qidx[q] = ai end
+                    end
+                end
+            else
+                -- 先看有没有问法撞车的已有条目
+                local target = nil
+                for _, q in ipairs(qs) do
+                    if qidx[q] ~= nil then target = qidx[q] break end
+                end
+                if target then
+                    -- 问法相同、答案不同：答案合并，命中时轮换
+                    local it = items[target]
+                    if it.a ~= a then
+                        it.a = it.a .. "\3" .. a
+                        aidx[it.a] = target
+                    end
+                    local seen = {}
+                    for _, q in ipairs(it.qs) do seen[q] = true end
+                    for _, q in ipairs(qs) do
+                        if not seen[q] then
+                            seen[q] = true
+                            it.qs[#it.qs + 1] = q
+                            if qidx[q] == nil then qidx[q] = target end
+                        end
+                    end
+                else
+                    local n = #items + 1
+                    items[n] = { qs = qs, a = a }
+                    aidx[a] = n
+                    for _, q in ipairs(qs) do
+                        if qidx[q] == nil then qidx[q] = n end
+                    end
+                end
+            end
+        end
+    end
+    return items, aidx, qidx
+end
+
+-- ---------- 词典压缩 ----------
+local function kbBuildDict(list)
+    local cnt, keys = {}, {}
+    for _, s2 in ipairs(list) do
+        local ch = toChars(s2)
+        for i = 1, #ch - 1 do
+            if string.byte(ch[i]) >= 0xE0 and string.byte(ch[i + 1]) >= 0xE0 then
+                local bg = ch[i] .. ch[i + 1]
+                if cnt[bg] == nil then
+                    cnt[bg] = 1
+                    keys[#keys + 1] = bg
+                else
+                    cnt[bg] = cnt[bg] + 1
+                end
+            end
+        end
+    end
+    table.sort(keys, function(a, b)
+        if cnt[a] ~= cnt[b] then return cnt[a] > cnt[b] end
+        return a < b
+    end)
+    local dict, idx = {}, {}
+    for i = 1, #keys do
+        if #dict >= KB_DICT_MAX then break end
+        if cnt[keys[i]] >= 2 then
+            dict[#dict + 1] = keys[i]
+            idx[keys[i]] = #dict
+        end
+    end
+    return dict, idx
+end
+
+local function kbEncodeOne(s2, idx)
+    local ch = toChars(s2)
+    local out, i, n = {}, 1, #ch
+    while i <= n do
+        if i < n then
+            local ix = idx[ch[i] .. ch[i + 1]]
+            if ix then
+                out[#out + 1] = KB_ESC .. string.char(ix + 1)
+                i = i + 2
+            else
+                local c = ch[i]
+                out[#out + 1] = (c == KB_ESC) and (KB_ESC .. "\255") or c
+                i = i + 1
+            end
+        else
+            local c = ch[i]
+            out[#out + 1] = (c == KB_ESC) and (KB_ESC .. "\255") or c
+            i = i + 1
+        end
+    end
+    return table.concat(out)
+end
+
+local function kbDecodeOne(s2, dict)
+    local out, i, n = {}, 1, #s2
+    while i <= n do
+        local c = string.sub(s2, i, i)
+        if c == KB_ESC then
+            local nx = string.sub(s2, i + 1, i + 1)
+            if nx == "\255" then
+                out[#out + 1] = KB_ESC
+            else
+                out[#out + 1] = dict[string.byte(nx) - 1] or ""
+            end
+            i = i + 2
+        else
+            out[#out + 1] = c
+            i = i + 1
+        end
+    end
+    return table.concat(out)
+end
+
+local function kbU16(n)
+    n = math.floor(n or 0)
+    if n > 65535 then n = 65535 end
+    if n < 0 then n = 0 end
+    return string.char(math.floor(n / 256), n % 256)
+end
+local function kbRd16(str, p)
+    return (string.byte(str, p) or 0) * 256 + (string.byte(str, p + 1) or 0), p + 2
+end
+
+-- 条目序列化：问法用 \1 分隔，问法组与答案用 \2 分隔，条目间用 \4 分隔
+local function kbItemToStr(it)
+    local qs = {}
+    for i = 1, #it.qs do qs[i] = it.qs[i] end
+    return table.concat(qs, "\1") .. "\2" .. it.a
+end
+local function kbStrToItem(s2)
+    local p = string.find(s2, "\2", 1, true)
+    if not p then return nil end
+    local qs = {}
+    for q in string.gmatch(string.sub(s2, 1, p - 1), "[^\1]+") do
+        qs[#qs + 1] = q
+    end
+    local a = string.sub(s2, p + 1)
+    if #qs == 0 or a == "" then return nil end
+    return { qs = qs, a = a }
+end
+
+local function kbCompress(items)
+    local flat = {}
+    for _, it in ipairs(items) do flat[#flat + 1] = kbItemToStr(it) end
+    local dict, idx = kbBuildDict(flat)
+    local parts = { "KB2", kbU16(#dict) }
+    for _, w in ipairs(dict) do
+        parts[#parts + 1] = string.char(#w)
+        parts[#parts + 1] = w
+    end
+    parts[#parts + 1] = kbU16(#flat)
+    for _, s2 in ipairs(flat) do
+        local e = kbEncodeOne(s2, idx)
+        parts[#parts + 1] = kbU16(#e)
+        parts[#parts + 1] = e
+    end
+    return table.concat(parts), dict
+end
+
+local function kbDecompress(blob)
+    if type(blob) ~= "string" or #blob < 4 then return nil end
+    if string.sub(blob, 1, 3) ~= "KB2" then return nil end
+    local p = 4
+    local dn
+    dn, p = kbRd16(blob, p)
+    local dict = {}
+    for i = 1, dn do
+        local wl = string.byte(blob, p) or 0
+        p = p + 1
+        dict[i] = string.sub(blob, p, p + wl - 1)
+        p = p + wl
+    end
+    local cnt
+    cnt, p = kbRd16(blob, p)
+    local items = {}
+    for i = 1, cnt do
+        local ln
+        ln, p = kbRd16(blob, p)
+        local enc = string.sub(blob, p, p + ln - 1)
+        p = p + ln
+        local it = kbStrToItem(kbDecodeOne(enc, dict))
+        if it then items[#items + 1] = it end
+    end
+    return items
+end
+
+-- ---------- 建库 ----------
+local function kbReindex()
+    local aidx, qidx, qn = {}, {}, 0
+    if not KB_ITEMS then return end
+    for i, it in ipairs(KB_ITEMS) do
+        aidx[it.a] = i
+        for _, q in ipairs(it.qs) do
+            if qidx[q] == nil then qidx[q] = i end
+            qn = qn + 1
+        end
+    end
+    KB_AIDX, KB_QIDX, KB_QN = aidx, qidx, qn
+end
+
+-- 全量重建（属性 + delta），返回条目数
+local function kbBuild()
+    local list = kbCollect()
+    if KB_DELTA then
+        for _, it in ipairs(KB_DELTA) do
+            list[#list + 1] = kbItemToStr(it)
+        end
+    end
+    KB_RAW_BYTES = 0
+    for i = 1, #list do KB_RAW_BYTES = KB_RAW_BYTES + #list[i] end
+    KB_DELTA = nil
+    if #list == 0 then
+        KB_ITEMS = nil
+        KB_BLOB = nil
+        KB_ZIP_BYTES = 0
+        KB_DICT_N = 0
+        KB_QN = 0
+        KB_AIDX, KB_QIDX = nil, nil
+        return 0
+    end
+    local items = kbMerge(list)
+    local blob, dict = kbCompress(items)
+    KB_BLOB = blob
+    KB_ZIP_BYTES = #blob
+    KB_DICT_N = #dict
+    KB_ITEMS = items
+    kbReindex()
+    return #items
+end
+
+-- ---------- 打分：加权重叠系数 ----------
+-- 短句共享字少，用余弦分母一压就到 0.1 以下，门槛根本设不了。
+-- 改成 match / min(sumQ, sumC)：只看"较少的那一边覆盖了多少"，
+-- 实测正例 0.620 / 负例 0.069，区分度比余弦高一个量级。
+local function kbSim(qt, qw, ct, cw)
+    local inner = {}
+    for i, t in ipairs(ct) do inner[t] = cw[i] end
+    local match, hit, sq, sc = 0, 0, 0, 0
+    for i, t in ipairs(qt) do
+        local w = qw[i]
+        sq = sq + w
+        local o = inner[t]
+        if o then
+            match = match + (w < o and w or o)
+            hit = hit + 1
+        end
+    end
+    for i = 1, #cw do sc = sc + cw[i] end
+    if match <= 0 then return 0, 0 end
+    local m = sq < sc and sq or sc
+    if m <= 0 then return 0, 0 end
+    return match / m, hit / #qt
+end
+
+-- 从持久化文本（Base85(KB2 blob)）恢复，返回条目数
+local function kbLoadPersisted(b85txt)
+    local ok, blob = pcall(function() return b85Decode(b85txt) end)
+    if not ok or type(blob) ~= "string" then return 0 end
+    local items = kbDecompress(blob)
+    if not items or #items == 0 then return 0 end
+    KB_ITEMS = items
+    KB_DELTA = nil
+    KB_BLOB = blob
+    KB_ZIP_BYTES = #blob
+    KB_DICT_N = 0
+    KB_RAW_BYTES = 0
+    for _, it in ipairs(items) do KB_RAW_BYTES = KB_RAW_BYTES + #kbItemToStr(it) end
+    kbReindex()
+    return #items
+end
+
+-- ---------- 检索：对所有问法取最高分 ----------
+local function kbScan(items, qt, qw, query, best, bestScore, bestQ)
+    if not items then return best, bestScore, bestQ end
+    for i = 1, #items do
+        local it = items[i]
+        for _, q in ipairs(it.qs) do
+            local ct, cw = tokOf(q)
+            local sc, cov = kbSim(qt, qw, ct, cw)
+            if cov >= 0.20 then
+                if q == query then
+                    sc = 1.0
+                elseif #query >= 2 and #q >= #query and string.sub(q, 1, #query) == query then
+                    sc = sc + 0.15
+                elseif #q >= 2 and #query >= #q and string.sub(query, 1, #q) == q then
+                    sc = sc + 0.12
+                end
+                -- 答案里有多条（问法撞车合并过）时按 \3 拆，这里只取第一条做代表
+                if sc > bestScore then
+                    bestScore = sc
+                    best = it
+                    bestQ = q
+                end
+            end
+        end
+    end
+    return best, bestScore, bestQ
+end
+
+local function kbRetrieve(query)
+    if (not KB_ITEMS or #KB_ITEMS == 0) and (not KB_DELTA or #KB_DELTA == 0) then
+        return nil, 0, nil
+    end
+    local qt, qw = buildTok(query)
+    if #qt == 0 then return nil, 0, nil end
+    local best, bestScore, bestQ = nil, 0, nil
+    best, bestScore, bestQ = kbScan(KB_ITEMS, qt, qw, query, best, bestScore, bestQ)
+    best, bestScore, bestQ = kbScan(KB_DELTA, qt, qw, query, best, bestScore, bestQ)
+    if not best then return nil, 0, nil end
+    -- 答案是合并过的多条时按会话轮换，返回单条
+    local a = best.a
+    local sep = string.find(a, "\3", 1, true)
+    if sep then
+        a = string.sub(a, 1, sep - 1)
+    end
+    return a, bestScore, bestQ
+end
+
+--==================== 回答命中缓存 ====================
+-- 高分回答记下来，下次同样的问题直接回，零检索耗时。
+-- 组件属性 answerCache 存的是它的持久化文本（Base85 编码），
+-- 启动时自动导入；用户也可以调 导出缓存 拿到文本粘进属性里。
+local ACACHE = {}
+local ACACHE_ORDER = {}
+local ACACHE_N = 0
+local RATE_SUM = 0
+local RATE_CNT = 0
+
+local function normKey(s)
+    if type(s) ~= "string" then s = tostring(s or "") end
+    s = string.gsub(s, "%s+", "")
+    s = string.gsub(s, "[\1-\8\11\12\14-\31]", "")
+    return s
+end
+
+local function b85Encode(str)
+    local out = {}
+    local i, n = 1, #str
+    local floor = math.floor
+    local schar = string.char
+    while i <= n do
+        local a, b, c, d = string.byte(str, i, i + 3)
+        a = a or 0; b = b or 0; c = c or 0; d = d or 0
+        local v = a * 16777216 + b * 65536 + c * 256 + d
+        local t = {}
+        for k = 1, 5 do
+            t[6 - k] = schar(0x21 + (v % 85))
+            v = floor(v / 85)
+        end
+        out[#out + 1] = table.concat(t)
+        i = i + 4
+    end
+    return table.concat(out)
+end
+
+local function acachePut(key, reply, score, src)
+    local cap = getNumProp("cacheMax", 300)
+    if cap <= 0 then return false end
+    if key == "" or type(reply) ~= "string" or reply == "" then return false end
+    local e = ACACHE[key]
+    if e then
+        e.reply = reply
+        if (score or 0) > (e.score or 0) then e.score = score end
+        e.src = src or e.src
+        return true
+    end
+    ACACHE[key] = { reply = reply, score = score or 0, hits = 0, src = src or "自动" }
+    ACACHE_ORDER[#ACACHE_ORDER + 1] = key
+    ACACHE_N = ACACHE_N + 1
+    while ACACHE_N > cap do
+        local old = table.remove(ACACHE_ORDER, 1)
+        if old then
+            ACACHE[old] = nil
+        else
+            break
+        end
+        ACACHE_N = ACACHE_N - 1
+        if #ACACHE_ORDER == 0 then break end
+    end
+    return true
+end
+
+local function acacheSerialize()
+    local parts = {}
+    for _, k in ipairs(ACACHE_ORDER) do
+        local e = ACACHE[k]
+        if e then
+            parts[#parts + 1] = string.format("%.3f", e.score or 0) .. "\1" .. k .. "\1" .. e.reply
+        end
+    end
+    return table.concat(parts, "\2")
+end
+
+local function acacheLoadText(b85txt)
+    if type(b85txt) ~= "string" or b85txt == "" then return 0 end
+    local ok, raw = pcall(function() return b85Decode(b85txt) end)
+    if not ok or type(raw) ~= "string" or raw == "" then return 0 end
+    local n = 0
+    for entry in string.gmatch(raw, "[^\2]+") do
+        local p1 = string.find(entry, "\1", 1, true)
+        if p1 then
+            local p2 = string.find(entry, "\1", p1 + 1, true)
+            if p2 then
+                local sc = tonumber(string.sub(entry, 1, p1 - 1)) or 0
+                local k = string.sub(entry, p1 + 1, p2 - 1)
+                local a = string.sub(entry, p2 + 1)
+                if k ~= "" and a ~= "" then
+                    acachePut(k, a, sc, "属性")
+                    n = n + 1
+                end
+            end
+        end
+    end
+    return n
+end
+
+local function acacheLoad()
+    local txt = nil
+    local self_ = COMPONENT_SELF
+    if self_ ~= nil then
+        local ok, v = pcall(function() return self_.answerCache end)
+        if ok and type(v) == "string" then txt = v end
+    end
+    if txt == nil then txt = rawget(Script, "answerCache") end
+    if type(txt) == "string" and txt ~= "" then
+        local n = acacheLoadText(txt)
+        D("【启动】回答缓存已从属性恢复 " .. n .. " 条")
+        return n
+    end
+    return 0
+end
+
+--==================== 会话 ====================
+local SESSIONS = {}
+local SESSION_ORDER = {}
+local MAX_SESSIONS = 64
+
+local function getSession(sid)
+    sid = tostring(sid or "default")
+    local s = SESSIONS[sid]
+    if not s then
+        s = { id = sid, turns = {}, used = {}, last = 0, created = nowSec() }
+        SESSIONS[sid] = s
+        SESSION_ORDER[#SESSION_ORDER + 1] = sid
+        if #SESSION_ORDER > MAX_SESSIONS then
+            local old = table.remove(SESSION_ORDER, 1)
+            SESSIONS[old] = nil
+        end
+    end
+    return s
+end
+
+--==================== 兜底 ====================
+local FALLBACKS = {
+    "没太听懂，换个说法试试？",
+    "这个我还没学会，能不能说具体一点。",
+    "嗯……你在说什么呀？",
+    "我没理解你的意思，再说说？",
+    "这句话有点难，换种方式问我吧。"
+}
+
+local function fallbackReply(sess)
+    local mode = math.floor(tonumber(Script.fallbackMode) or 1)
+    if mode == 2 then
+        if sess and sess.lastQuery and sess.lastQuery ~= "" then
+            return "你是想问「" .. sess.lastQuery .. "」吗？我没太懂，能说详细点不？"
+        end
+        return FALLBACKS[randInt(#FALLBACKS)]
+    elseif mode == 0 then
+        return FALLBACKS[1]
+    end
+    return FALLBACKS[randInt(#FALLBACKS)]
+end
+
+--==================== 主检索 ====================
+local function retrieve(query, sess, maxn)
+    local qt, qw = buildTok(query)
+    if #qt == 0 then return nil, 0 end
+    -- 整句没有汉字（纯数字/纯字母/纯符号）通常是乱敲，
+    -- 这类输入总能撞上语料里的脏句子，直接拒答比硬答聪明。
+    -- 例外：hi / hello 这类种子会拿到 0.9 以上的分，下面放行。
+    local hasHan = false
+    for i = 1, #qt do
+        if string.byte(qt[i]) >= 0xE0 then hasHan = true break end
+    end
+    NO_HAN = not hasHan
+
+    local k = math.floor(tonumber(Script.topBuckets) or 4)
+    if k < 1 then k = 1 end
+    if k > 24 then k = 24 end
+
+    local bids = pickBuckets(qt, k)
+    -- 种子桶（高频寒暄）每次必扫：只有 168 条，代价可忽略，
+    -- 但能保证「你好 / 谢谢 / 你是谁」这类话一定接得住
+    local seedB = NBUCKET - 1
+    local hasSeed = false
+    for i = 1, #bids do if bids[i] == seedB then hasSeed = true break end end
+    if not hasSeed then bids[#bids + 1] = seedB end
+
+    local best, bestScore, bestB = nil, 0, nil
+    local minCov = tonumber(Script.minCoverage) or 0.25
+    local scanned = 0
+    for _, bid in ipairs(bids) do
+        local list = loadBucket(bid)
+        if list then
+            scanned = scanned + #list
+            for i = 1, #list do
+                local cq, ca = list[i][1], list[i][2]
+                if not (sess and sess.used[cq .. "\1" .. ca]) then
+                    -- 候选分词结果复用：同一批候选在后续对话里不再重复分词
+                    local ct, cw = tokOf(cq)
+                    local sc, cov = scorePair(qt, qw, ct, cw)
+                    -- 只靠相似度会把「一串乱码」也匹配上（总有那么一两个字撞上）。
+                    -- 再要求"查询里至少有一部分字真的出现在了问句里"，
+                    -- 乱码的覆盖率极低，一卡就掉。
+                    if cov < minCov then sc = 0 end
+                    -- 短问题惩罚过长候选，避免匹配到大段废话
+                    if #cq > 0 then
+                        local lenPenalty = 1
+                        local qlen = #query
+                        if qlen > 0 and #cq > qlen * 3 then
+                            lenPenalty = qlen * 3 / #cq
+                        end
+                        sc = sc * lenPenalty
+                    end
+                    -- 答案质量参与打分：检索式对话的答案池质量参差，
+                    -- 相似度接近时优先挑长度适中的（<4 字太敷衍，>20 字太长）
+                    local a0 = ca
+                    local sep = string.find(a0, "\3", 1, true)
+                    if sep then a0 = string.sub(a0, 1, sep - 1) end
+                    local alen = #a0
+                    local aq = 1.0
+                    if alen < 4 then aq = 0.6 elseif alen > 20 then aq = 0.8 end
+                    sc = sc * (0.7 + 0.3 * aq)
+                    -- 完全一致或前缀一致直接拉满：种子问答靠这条兜底，
+                    -- 否则「你好」会输给语料里字面上也很像的「你还好吗」
+                    if cq == query then
+                        sc = 1.0
+                    else
+                        local ql, cl = #query, #cq
+                        if ql >= 2 and cl >= ql and string.sub(cq, 1, ql) == query then
+                            sc = sc + 0.15
+                        elseif cl >= 2 and ql >= cl and string.sub(query, 1, cl) == cq then
+                            sc = sc + 0.10
+                        end
+                    end
+                    if NO_HAN and sc < 0.9 then sc = 0 end
+                    if sc > bestScore then
+                        bestScore = sc
+                        best = { cq, ca }
+                        bestB = bid
+                    end
+                end
+            end
+        end
+    end
+    return best, bestScore, scanned
+end
+
+-- 判断一句话是否"干净"（中文 + 少量常用标点），决定能不能念给用户听
+local function isClean(s)
+    if type(s) ~= "string" or #s == 0 then return false end
+    local n = 0
+    for c in string.gmatch(s, "[\1-\127\194-\244][\128-\191]*") do
+        n = n + 1
+        if string.byte(c) < 0x80 and not string.match(c, "[，。！？、,.!?~～]") then
+            return false
+        end
+    end
+    return n > 0
+end
+
+--==================== 后处理 ====================
+local function trimReply(s)
+    local maxLen = math.floor(tonumber(Script.replyMaxLen) or 60)
+    if maxLen <= 0 then return s end
+    local cs = toChars(s)
+    if #cs <= maxLen then return s end
+    -- 按「字符数」截断。之前按字节累加，中文一个字 3 字节，
+    -- 结果 maxLen=10 只切出 3 个字，明显不对。
+    local ncut = maxLen
+    for i = maxLen, math.floor(maxLen * 0.5), -1 do
+        if string.match(cs[i], "[。！？!?；;，,]") then ncut = i break end
+    end
+    local out, acc = {}, 0
+    for i = 1, ncut do out[i] = cs[i] end
+    local head = table.concat(out)
+    local cut = #head
+    if cut <= 0 then return "" end
+    local head = string.sub(s, 1, cut)
+    -- 优先在标点处断句
+    local lastP = 0
+    for p in string.gmatch(head, "()[。！？!?；;，,]") do
+        lastP = p
+    end
+    if lastP > cut * 0.4 then
+        return string.sub(s, 1, lastP)
+    end
+    return head
+end
+
+--==================== 出口净化 ====================
+-- 兜底保险：万一答案里混进非法字节（语料有截断字符），
+-- 这里扫一遍，从第一个非法字符处截断，保证返回的一定是合法 UTF-8
+local function sanitizeUtf8(s)
+    if type(s) ~= "string" or #s == 0 then return s or "" end
+    local n = #s
+    local i = 1
+    while i <= n do
+        local b = string.byte(s, i)
+        local len
+        if b < 0x80 then len = 1
+        elseif b >= 0xF0 then len = 4
+        elseif b >= 0xE0 then len = 3
+        elseif b >= 0xC0 then len = 2
+        else break end                     -- 0x80-0xBF 孤立的续字节 = 非法
+        if i + len - 1 > n then break end  -- 结尾被截断
+        local ok = true
+        for k = 1, len - 1 do
+            local c = string.byte(s, i + k)
+            if not (c >= 0x80 and c < 0xC0) then ok = false break end
+        end
+        if not ok then break end
+        i = i + len
+    end
+    if i > n then return s end
+    return string.sub(s, 1, i - 1)
+end
+
+--==================== 开放函数 ====================
+-- 真正的对话逻辑。内部出错由下面的 Chat 壳兜住。
+--====================================================================
+-- 统计生成引擎（字符 3-gram 语言模型）
+--
+-- 与检索式的区别（说人话）：
+--   检索式 = 从 20 万条语料里挑一句最像的，原样返回（不会造句）
+--   统计式 = 从语料里统计「哪三个字常连在一起」，然后逐字采样造句
+--
+-- 本块只负责「造句」：给定前两个字，按语料统计出的概率挑下一个字，
+-- 一直挑到句尾符（EOS）或达到长度上限。
+--   三元（看前 2 字）优先；三元没统计到就退化到二元（看前 1 字）；
+--   都没有就停下。词表 4096 字，覆盖语料 99.97% 的用字。
+--
+-- 模型存放：与语料同样的二维表通道（deflate + Base85），3 张表，
+-- 每张是一个独立压缩切片，读入后按顺序拼接再解析。
+--====================================================================
+
+local NG_BOS, NG_EOS, NG_UNK = 0, 1, 2
+local NG_NG3 = "NG3"
+
+local NG_LOADED = false
+local NG_ERR = nil
+local NG_V = 4096
+local NG_CH = nil      -- code(+1) -> 字符
+local NG_IDX = nil     -- 字符 -> code
+local NG_KEY = nil     -- 三元组的 key 数组（升序，二分查找）
+local NG_OFF = nil     -- key 对应的数据在 NG_DAT 里的起始位置
+local NG_DAT = ""      -- 连续化后的三元/二元数据
+local NG_BKEY = nil
+local NG_BOFF = nil
+local NG_BDAT = ""
+local NG_N3, NG_N2 = 0, 0
+local RUNTIME_NG_IDS = nil
+
+local function ngIdsFromArray()
+    local v = getProp("ngTableIds")
+    v = unwrapArray(v)
+    if type(v) ~= "table" then return nil end
+    local out = {}
+    for i = 1, 64 do
+        local ok, x = pcall(function() return v[i] end)
+        if not ok or x == nil then break end
+        if type(x) == "string" and x ~= "" then out[#out + 1] = x end
+    end
+    if #out > 0 then return out end
+    return nil
+end
+
+local function getNgIds()
+    if RUNTIME_NG_IDS and #RUNTIME_NG_IDS > 0 then return RUNTIME_NG_IDS end
+    local a = ngIdsFromArray()
+    if a then return a end
+    local raw = getProp("ngTableIdsText")
+    if type(raw) == "string" and raw ~= "" then
+        local t = splitIds(raw)
+        if #t > 0 then return t end
+    end
+    return nil
+end
+
+local function ngReadVarint(s, p)
+    local v, sh = 0, 0
+    while true do
+        local b = string.byte(s, p)
+        if b == nil then return nil, p end
+        p = p + 1
+        v = v + bit.blshift(bit.band(b, 0x7F), sh)
+        sh = sh + 7
+        if bit.band(b, 0x80) == 0 then break end
+    end
+    return v, p
+end
+
+-- 按 UTF-8 把字符串拆成单字数组
+local function utfSplit(s)
+    local out, i, n = {}, 1, #s
+    while i <= n do
+        local b = string.byte(s, i) or 0
+        local ln = 1
+        if b >= 240 then ln = 4 elseif b >= 224 then ln = 3 elseif b >= 192 then ln = 2 end
+        out[#out + 1] = string.sub(s, i, i + ln - 1)
+        i = i + ln
+    end
+    return out
+end
+
+local function loadNG()
+    if NG_LOADED then return NG_ERR == nil end
+    NG_LOADED = true
+    local ids = getNgIds()
+    if not ids then NG_ERR = "未配置生成模型二维表ID组"; return false end
+    local parts = {}
+    for i = 1, #ids do
+        local rows = readTable(ids[i])
+        if not rows then NG_ERR = "读表失败 " .. tostring(ids[i]); return false end
+        local off = 1
+        local h0 = rows[1] and pickField(rows[1])
+        if type(h0) == "string" and string.sub(h0, 1, 4) == "NG3|" then off = 2 end
+        local chunks = {}
+        for r = off, #rows do
+            local v = rows[r] and pickField(rows[r])
+            if type(v) == "string" and v ~= "" then chunks[#chunks + 1] = v end
+        end
+        local b85 = table.concat(chunks)
+        if #b85 == 0 then NG_ERR = "取到空内容 表" .. tostring(i); return false end
+        local ok, out = pcall(function() return Inflater.inflate(b85Decode(b85), 3) end)
+        if not ok or type(out) ~= "string" or #out == 0 then
+            NG_ERR = "解压失败 表" .. tostring(i) .. " " .. tostring(out)
+            return false
+        end
+        parts[#parts + 1] = out
+    end
+    local s = table.concat(parts)
+    if string.sub(s, 1, 3) ~= NG_NG3 then NG_ERR = "魔数不对"; return false end
+    local p = 5
+    NG_V = (string.byte(s, p) or 0) * 256 + (string.byte(s, p + 1) or 0)
+    p = p + 2
+    local nl = string.find(s, "\n", p, true)
+    if not nl then NG_ERR = "词表头缺失"; return false end
+    local voc = string.sub(s, p, nl - 1)
+    p = nl + 1
+    NG_CH = { "\0", "\1", "\2" }
+    local cs = utfSplit(voc)
+    for i = 1, #cs do NG_CH[#NG_CH + 1] = cs[i] end
+    NG_IDX = {}
+    for i = 1, #NG_CH do NG_IDX[NG_CH[i]] = i - 1 end
+
+    local function readSec(isTri)
+        local cnt = (string.byte(s, p) or 0) * 16777216 +
+                    (string.byte(s, p + 1) or 0) * 65536 +
+                    (string.byte(s, p + 2) or 0) * 256 +
+                    (string.byte(s, p + 3) or 0)
+        p = p + 4
+        local keys, offs, buf = {}, {}, {}
+        local pos, prev, cur = 1, 0, 0
+        for _ = 1, cnt do
+            local d
+            d, p = ngReadVarint(s, p)
+            if d == nil then NG_ERR = (isTri and "三元" or "二元") .. "头损坏"; return nil end
+            local k = prev + d
+            prev = k
+            local n = string.byte(s, p)
+            p = p + 1
+            if n == nil then NG_ERR = (isTri and "三元" or "二元") .. "长度损坏"; return nil end
+            keys[pos] = k
+            -- cur 必须自己累加：这一轮里 NG_DAT/NG_BDAT 还是旧值（要等 concat 完才赋值），
+            -- 拿 #NG_DAT 当偏移会全部算成 1，二分查到也对不上数据。
+            offs[pos] = cur + 1
+            buf[#buf + 1] = string.char(n)
+            buf[#buf + 1] = string.sub(s, p, p + n * 2 - 1)
+            cur = cur + 1 + n * 2
+            p = p + n * 2
+            pos = pos + 1
+        end
+        if isTri then
+            NG_KEY, NG_OFF, NG_DAT, NG_N3 = keys, offs, table.concat(buf), cnt
+        else
+            NG_BKEY, NG_BOFF, NG_BDAT, NG_N2 = keys, offs, table.concat(buf), cnt
+        end
+        return true
+    end
+
+    if not readSec(true) then return false end
+    if not readSec(false) then return false end
+    NG_ERR = nil
+    return true
+end
+
+local function ngFindKey(keys, key)
+    if not keys then return nil end
+    local lo, hi = 1, #keys
+    while lo <= hi do
+        local mid = math.floor((lo + hi) / 2)
+        local v = keys[mid]
+        if v == key then return mid elseif v < key then lo = mid + 1 else hi = mid - 1 end
+    end
+    return nil
+end
+
+-- 在数据串 off 处取第 j 个候选（1-based），返回 code 与权重
+local function ngAt(dat, off, j)
+    local q = off + 1 + (j - 1) * 2
+    local b1 = string.byte(dat, q) or 0
+    local b2 = string.byte(dat, q + 1) or 0
+    return b1 * 16 + math.floor(b2 / 16), b2 % 16
+end
+
+local function ngPickIdx(dat, off, greedy)
+    local n = string.byte(dat, off) or 0
+    if n <= 0 then return nil, 0 end
+    if greedy then
+        local bc, bw = nil, -1
+        for j = 1, n do
+            local c, w = ngAt(dat, off, j)
+            if w > bw then bw, bc = w, c end
+        end
+        return bc, bw
+    end
+    local tot = 0
+    for j = 1, n do
+        local _, w = ngAt(dat, off, j)
+        tot = tot + w
+    end
+    if tot <= 0 then return nil, 0 end
+    local r = randInt(tot)
+    local acc = 0
+    for j = 1, n do
+        local c, w = ngAt(dat, off, j)
+        acc = acc + w
+        if r <= acc then return c, w end
+    end
+    local c, w = ngAt(dat, off, n)
+    return c, w
+end
+
+local function ngCode(ch)
+    if type(ch) ~= "string" or ch == "" then return NG_UNK end
+    local v = NG_IDX and NG_IDX[ch]
+    if v == nil then return NG_UNK end
+    return v
+end
+
+local function ngTextOf(codes)
+    local t = {}
+    for i = 1, #codes do
+        t[i] = (NG_CH and NG_CH[codes[i] + 1]) or ""
+    end
+    return table.concat(t)
+end
+
+-- 核心：从 (a,b) 两个前字出发逐字采样，返回 {字码数组} 与 {权重数组}
+local function ngGen(a, b, maxLen, greedy)
+    local out, ws = {}, {}
+    for _ = 1, maxLen do
+        local i3 = ngFindKey(NG_KEY, a * NG_V + b)
+        local dat, off
+        if i3 then dat, off = NG_DAT, NG_OFF[i3]
+        else
+            local i2 = ngFindKey(NG_BKEY, b)
+            if not i2 then break end
+            dat, off = NG_BDAT, NG_BOFF[i2]
+        end
+        local c, w = ngPickIdx(dat, off, greedy)
+        if c == nil then break end
+        if c == NG_EOS then break end
+        local m = #out
+        if m >= 2 and out[m] == c and out[m - 1] == c then break end
+        out[m + 1] = c
+        ws[m + 1] = w
+        a, b = b, c
+    end
+    return out, ws
+end
+
+-- 对外：把检索到的答案改写成统计生成的句子
+local function applyGen(reply, best, userText)
+    local mode = math.floor(getNumProp("genMode", 1) or 1)
+    if mode <= 0 then return reply end
+    local okL = loadNG()
+    if not okL then return reply end
+
+    local A = nil
+    if mode == 1 then
+        if type(best) == "table" and type(best[2]) == "string" then
+            local s = best[2]
+            local q = string.find(s, "\3", 1, true)
+            if q then s = string.sub(s, 1, q - 1) end
+            A = trimReply(s)
+        end
+        if type(A) ~= "string" or A == "" then return reply end
+    end
+
+    local keep = math.floor(getNumProp("genKeep", 4) or 4)
+    local tries = math.floor(getNumProp("genTries", 5) or 5)
+    local maxLen = math.floor(getNumProp("genMaxLen", 30) or 30)
+    local greedy = getProp("genGreedy") == true
+    if tries < 1 then tries = 1 end
+    if maxLen < 4 then maxLen = 4 end
+
+    local seed = ""
+    local a, b = NG_BOS, NG_BOS
+    if mode == 1 then
+        local cs = utfSplit(A)
+        for i = 1, keep do
+            if i > #cs then break end
+            seed = seed .. cs[i]
+        end
+        -- 上下文必须取【种子】的末两字，不是整句答案的末两字。
+        -- 取错的话后面接的是答案尾巴，跟保留下来的开头接不上，句子会断成两截。
+        local sc2 = utfSplit(seed)
+        if #sc2 >= 2 then
+            a = ngCode(sc2[#sc2 - 1]); b = ngCode(sc2[#sc2])
+        elseif #sc2 == 1 then
+            a, b = NG_BOS, ngCode(sc2[1])
+        end
+    elseif type(userText) == "string" and userText ~= "" then
+        -- 纯生成：拿用户这句话的末两字当种子，让回答接得上
+        local cs = utfSplit(userText)
+        if #cs >= 2 then a = ngCode(cs[#cs - 1]); b = ngCode(cs[#cs])
+        elseif #cs == 1 then a, b = NG_BOS, ngCode(cs[1]) end
+    end
+
+    local bestTxt, bestSc = nil, -1e9
+    for _ = 1, tries do
+        local codes, ws = ngGen(a, b, maxLen, greedy)
+        if #codes > 0 then
+            local txt = seed .. ngTextOf(codes)
+            local sc, sw = 0, #ws
+            if sw > 0 then
+                for i = 1, sw do sc = sc + ws[i] end
+                sc = sc / sw
+            end
+            -- 长度偏离检索答案越远越扣分，避免生成一句没边的话
+            if A and #A > 0 then sc = sc - 0.15 * math.abs(#txt - #A) end
+            if sc > bestSc then bestSc, bestTxt = sc, txt end
+        end
+    end
+
+    if type(bestTxt) ~= "string" or bestTxt == "" then return reply end
+    local mx = math.floor(getNumProp("replyMaxLen", 60) or 60)
+    if mx > 0 and #bestTxt > mx then bestTxt = string.sub(bestTxt, 1, mx) end
+    return bestTxt
+end
+
+function Script:SetNgIds(text)
+    bindSelf(self)
+    if type(text) ~= "string" then return "参数应是字符串" end
+    RUNTIME_NG_IDS = splitIds(text)
+    NG_LOADED = false
+    NG_ERR = nil
+    return "已设置生成表 " .. #RUNTIME_NG_IDS .. " 个"
+end
+
+function Script:Gen(seedText)
+    bindSelf(self)
+    local okL = loadNG()
+    if not okL then return "生成模型未就绪: " .. tostring(NG_ERR) end
+    local a, b = NG_BOS, NG_BOS
+    local seed = ""
+    if type(seedText) == "string" and seedText ~= "" then
+        seed = seedText
+        local cs = utfSplit(seedText)
+        if #cs >= 2 then a = ngCode(cs[#cs - 1]); b = ngCode(cs[#cs])
+        elseif #cs == 1 then a, b = NG_BOS, ngCode(cs[1]) end
+    end
+    local maxLen = math.floor(getNumProp("genMaxLen", 30) or 30)
+    local greedy = getProp("genGreedy") == true
+    local res = {}
+    for i = 1, 5 do
+        local codes = ngGen(a, b, maxLen, greedy)
+        res[i] = seed .. ngTextOf(codes)
+    end
+    return table.concat(res, " ｜ ")
+end
+
+function Script:GenStats()
+    bindSelf(self)
+    local ids = getNgIds()
+    local lines = {}
+    lines[#lines + 1] = "生成模型: " .. (NG_ERR and ("未就绪 " .. tostring(NG_ERR)) or
+        (NG_KEY and "已加载" or "未加载"))
+    lines[#lines + 1] = "表ID数: " .. tostring(ids and #ids or 0)
+    if NG_KEY then
+        lines[#lines + 1] = string.format("词表=%d 三元=%d 二元=%d 数据=%.0fKB",
+            NG_V, NG_N3, NG_N2, (#NG_DAT + #NG_BDAT) / 1024)
+    end
+    lines[#lines + 1] = "模式=" .. tostring(getNumProp("genMode", 1)) ..
+        " 保留前" .. tostring(getNumProp("genKeep", 4)) .. "字" ..
+        " 采样" .. tostring(getNumProp("genTries", 5)) .. "次"
+    return table.concat(lines, "\n")
+end
+
+function Script:ChatImpl(sessionId, userText)
+    bindSelf(self)
+    local t0 = nowMs()
+    if type(userText) ~= "string" then userText = tostring(userText or "") end
+    -- 去掉首尾空白
+    userText = string.gsub(userText, "^%s+", "")
+    userText = string.gsub(userText, "%s+$", "")
+    if userText == "" then
+        return "说点什么吧～"
+    end
+
+    local sess = getSession(sessionId)
+    local useCtx = Script.enableContext ~= false
+
+    -- 两段式：先按当前这句话单独检索；分不够再带上上文重试。
+    --（原来无脑把上文拼进查询，结果「你好」之后的「你是谁」被拼成
+    --  「你好 你是谁」，去匹配了完全不相干的句子）
+    -- ① 回答缓存：高分回答/用户点过赞的直接回，零检索耗时
+    local ck = normKey(userText)
+    local cached = ACACHE[ck]
+    if cached then
+        local creply = sanitizeUtf8(trimReply(cached.reply))
+        if creply ~= "" then
+            cached.hits = (cached.hits or 0) + 1
+            sess.lastQuery = userText
+            sess.lastReply = creply
+            sess.lastRawReply = creply
+            sess.lastScore = cached.score
+            sess.lastSrc = "缓存"
+            sess.turns[#sess.turns + 1] = { userText, creply, cached.score }
+            local keepC = math.floor(tonumber(Script.contextTurns) or 2) * 2 + 4
+            while #sess.turns > keepC do table.remove(sess.turns, 1) end
+            sess.last = nowSec()
+            D(string.format("[LLM] 缓存命中 分=%.3f 累计%d次 来源=%s",
+                cached.score or 0, cached.hits, tostring(cached.src)))
+            return creply
+        end
+    end
+
+    -- ② 资料库：用户自己填的，优先级高于内置语料
+    local kbAns, kbSc, kbQ = kbRetrieve(userText)
+    local best, sc, scanned = retrieve(userText, sess)
+    local minScore = tonumber(Script.minScore) or 0.16
+    local kbMin = getNumProp("kbMinScore", 0.35)
+    if kbAns and kbSc >= kbMin and kbSc >= (sc or 0) then
+        best = { kbQ, kbAns }
+        sc = kbSc
+        sess.lastSrc = "资料库"
+        D(string.format("[LLM] 资料库命中 分=%.3f 问=%s", kbSc, tostring(kbQ)))
+    else
+        sess.lastSrc = (best and sc and sc >= minScore) and "语料" or nil
+    end
+    if (not best or sc < minScore) and useCtx and sess.lastQuery and sess.lastQuery ~= "" and sess.lastSrc ~= "资料库" then
+        local ctxTurns = math.floor(tonumber(Script.contextTurns) or 2)
+        if ctxTurns > 0 then
+            local b2, s2, n2 = retrieve(sess.lastQuery .. " " .. userText, sess)
+            -- 直接检索已经失败才走到这里，所以不再打折扣：
+            -- 打折扣反而让「那算了」「为什么」这类短接话永远接不上。
+            if b2 and s2 > (sc or 0) then
+                best, sc, scanned = b2, s2, (scanned or 0) + (n2 or 0)
+            end
+        end
+    end
+
+    local reply
+    if best and sc >= minScore then
+        -- 一个问句打包了多条候选答案，按会话轮次轮换，避免同一个人总听同一句
+        local ca = best[2]
+        reply = ca
+        local p0, p1 = string.find(ca, "\3", 1, true)
+        if p0 then
+            local list = {}
+            local pos = 1
+            while true do
+                local a, b = string.find(ca, "\3", pos, true)
+                if a then
+                    list[#list + 1] = string.sub(ca, pos, a - 1)
+                    pos = b + 1
+                else
+                    list[#list + 1] = string.sub(ca, pos)
+                    break
+                end
+            end
+            if #list > 0 then
+                -- 轮换索引按「问句」记，不是按会话轮次：
+                -- 否则第 14 次对话会去取第 14%3=2 条，轮到质量最差的候选
+                sess.ridx = sess.ridx or {}
+                local ri = (sess.ridx[best[1]] or 0) % #list + 1
+                sess.ridx[best[1]] = ri
+                reply = list[ri]
+            end
+        end
+        sess.used[best[1] .. "\1" .. best[2]] = true
+        -- 已用条目超过一定量就清空，避免越聊越窄
+        sess.usedCount = (sess.usedCount or 0) + 1
+        if sess.usedCount > 200 then
+            sess.used = {}
+            sess.usedCount = 0
+        end
+        sess.lastMatch = best[1]
+    else
+        reply = fallbackReply(sess)
+        sess.lastMatch = nil
+        -- 没命中时把原因打出来：多半是桶没加载上
+        local loaded = 0
+        for _ in pairs(BUCKETS) do loaded = loaded + 1 end
+        if Script.debugMode ~= false then
+            D("未命中: 输入=" .. userText ..
+              " 分=" .. string.format("%.4f", sc or 0) ..
+              " 门槛=" .. tostring(minScore) ..
+              " 扫=" .. tostring(scanned) ..
+              " 已加载桶=" .. loaded)
+        end
+        -- 一条都没扫到 = 数据根本没进来。这里不判 debugMode，
+        -- 首次必定自动跑一次快检，保证用户截图就能看到原因。
+        if (scanned or 0) == 0 then
+            D("【自动诊断】扫到 0 条，二维表数据没进来，开始快检:")
+            if not AUTO_DIAG_DONE then
+                AUTO_DIAG_DONE = true
+                Script:QuickCheck()
+            else
+                D("  (快检已跑过，要看完整版请调 全面自检 / 单桶诊断)")
+            end
+        end
+    end
+
+    reply = sanitizeUtf8(trimReply(reply))
+    if reply == "" then reply = fallbackReply(sess) end
+
+    -- 统计生成：模式>0 时把上面检索到的句子改写成统计模型造出来的句子。
+    -- 整个块 pcall 包住：模型没配/没加载好就直接退回检索结果，绝不影响主流程。
+    local okG, genR = pcall(applyGen, reply, best, userText)
+    if okG and type(genR) == "string" and genR ~= "" then
+        reply = genR
+    elseif Script.debugMode then
+        D("[NG] 未启用: " .. tostring(genR))
+    end
+
+    -- 原始回复先记下来（后面可能加反问前缀，缓存里要存干净的版本）
+    sess.lastRawReply = reply
+    -- 高分回答自动入缓存，下次同样的问题直接回
+    if best and sc and ck ~= "" then
+        local cm = getNumProp("cacheMinScore", 0.55)
+        if sc >= cm then
+            acachePut(ck, reply, sc, "自动")
+        end
+    end
+
+    -- 低置信度缓冲：分不够高时先确认对方是不是这个意思，再给答案。
+    -- 检索式对话最容易答非所问，硬给一句会很傻，加个反问反而显得懂。
+    local hedge = tonumber(Script.hedgeScore) or 0.35
+    -- 兜底文案不该再套缓冲前缀，否则会出现
+    -- "我不太确定，不过——我没理解你的意思，再说说？" 这种自我矛盾的输出
+    local isFb = false
+    for i = 1, #FALLBACKS do
+        if reply == FALLBACKS[i] then isFb = true break end
+    end
+    if best and sc and sc < hedge and not isFb and Script.enableHedge ~= false then
+        local mq = best[1]
+        -- 只在"确实有点像但没把握"时把匹配到的问句念出来确认。
+        -- 分太低说明只是瞎撞上，念出来会把语料里的脏句子暴露给用户，更傻。
+        if mq and #mq <= 20 and sc >= 0.28 and isClean(mq) then
+            reply = "你是说「" .. mq .. "」吗？" .. reply
+        else
+            reply = "我不太确定，不过——" .. reply
+        end
+    end
+
+    -- 更新会话
+    sess.lastQuery = userText
+    sess.lastReply = reply
+    sess.lastScore = sc
+    sess.turns[#sess.turns + 1] = { userText, reply, sc }
+    local keep = math.floor(tonumber(Script.contextTurns) or 2) * 2 + 4
+    while #sess.turns > keep do table.remove(sess.turns, 1) end
+    sess.last = nowSec()
+
+    local dt = nowMs() - t0
+    if Script.debugMode then
+        print(string.format("[LLM] 桶=%s 分=%.4f 扫=%d 命中=%s 耗时=%.0fms",
+            tostring(Script.topBuckets), sc or 0, scanned or 0,
+            tostring(sess.lastMatch), dt))
+    end
+    if type(reply) ~= "string" or reply == "" then
+        reply = fallbackReply(sess)
+    end
+    return reply
+end
+
+-- 对外入口。引擎里一旦抛错，调用方拿到的就是 nil（实测过），
+-- 而且错误会打断触发器链路。这里用 pcall 全兜：
+-- 无论内部出什么事，都返回一个能显示的字符串。
+function Script:Chat(sessionId, userText)
+    local ok, res = pcall(Script.ChatImpl, self, sessionId, userText)
+    if not ok then
+        -- 出错就把诊断全打出来，方便直接截图
+        D("!!!! Chat 内部异常 !!!!")
+        D("错误: " .. tostring(res))
+        local ids = getIds()
+        if type(ids) ~= "table" then
+            D("【原因】组件属性 tableIds 没配置(type=" .. tostring(type(ids)) .. ")")
+            D("【怎么办】选中该组件 -> 属性面板 -> 模型二维表ID组，")
+            D("         按顺序填入 14 个 ID: llm_data_1 ~ llm_data_14")
+        elseif #ids < 14 then
+            D("【原因】tableIds 只填了 " .. #ids .. " 个，需要 14 个")
+            D("【怎么办】补全 llm_data_1 ~ llm_data_14")
+        else
+            D("tableIds=" .. #ids .. " 个")
+            if ids[1] then
+                local rows = readTable(ids[1])
+                D("表1 " .. tostring(ids[1]) .. " -> " ..
+                  (rows and ("行" .. #rows .. " 列" .. tostring(rows[1] and #rows[1] or 0)) or "读不到"))
+            end
+        end
+        -- 出错也尽量给一句人话，别让玩家看到 nil
+        local f = FALLBACKS and FALLBACKS[randInt(#FALLBACKS)] or "我没听清，再说一遍？"
+        return f
+    end
+    if type(res) ~= "string" or res == "" then
+        return FALLBACKS and FALLBACKS[randInt(#FALLBACKS)] or "我没听清，再说一遍？"
+    end
+    return res
+end
+
+--=========== 快检：只看表 + 抽 3 个桶，秒级出结果 ===========
+-- 不依赖 debugMode 也会自动跑一次，避免用户没开调试开关就看不到原因。
+local AUTO_DIAG_DONE = false
+
+function Script:QuickCheck()
+    bindSelf(self)
+    D("======== 快检（自动）========")
+    local ids = getIds()
+    if type(ids) ~= "table" then
+        D("【致命】tableIds 不是数组，type=" .. tostring(type(ids)))
+        D("======== 快检结束 ========")
+        return "tableIds 未配置"
+    end
+    D("tableIds: " .. #ids .. " 个")
+    -- 期望行数
+    local expectRows = {}
+    for b = 0, NBUCKET - 1 do
+        local m = MANIFEST[b]
+        if m then
+            local ti = m[1]
+            if not expectRows[ti] or m[3] > expectRows[ti] then expectRows[ti] = m[3] end
+        end
+    end
+    -- 表探测（只打异常 + 前 3 个）
+    local bad = 0
+    for i = 1, #ids do
+        local tid = ids[i]
+        local rows = readTable(tid)
+        local exp = expectRows[i - 1] or 0
+        if not rows then
+            D("表[" .. i .. "] " .. tostring(tid) .. " 【读不到】期望" .. exp .. "行")
+            bad = bad + 1
+        else
+            local h0 = rows[1] and pickField(rows[1])
+            local off = 1
+            if type(h0) == "string" and string.sub(h0, 1, 5) == "LLM1|" then off = 2 end
+            local dr = #rows - (off - 1)
+            local cols = rows[1] and #rows[1] or 0
+            if dr < exp or i <= 3 then
+                D("表[" .. i .. "] " .. tostring(tid) .. " 总行" .. #rows ..
+                  " 数据行" .. dr .. " 期望" .. exp .. " 列" .. cols ..
+                  (dr < exp and (" 【少" .. (exp - dr) .. "行】") or ""))
+                if rows[1] then
+                    local pv = {}
+                    for k = 1, math.min(cols, 4) do
+                        pv[#pv + 1] = "[" .. k .. "]" .. string.sub(tostring(rows[1][k]), 1, 16)
+                    end
+                    D("   首行: " .. table.concat(pv, " ") ..
+                      "  取值=" .. string.sub(tostring(h0), 1, 26))
+                end
+            end
+            if dr < exp then bad = bad + 1 end
+        end
+    end
+    -- 抽 3 个桶实测
+    local okN = 0
+    for _, b in ipairs({ 0, 100, 255 }) do
+        local r = loadBucket(b)
+        if r and r ~= false then
+            okN = okN + 1
+            D("抽样桶" .. b .. ": OK " .. #r .. " 条")
+        else
+            D("抽样桶" .. b .. ": 【失败】" .. tostring(BUCKET_FAIL[b]))
+        end
+    end
+    D("======== 快检结束：异常表 " .. bad .. " / 抽样成功 " .. okN .. "/3 ========")
+    if bad > 0 then return "有 " .. bad .. " 个表异常" end
+    if okN == 0 then return "桶全失败" end
+    return "表OK 抽样" .. okN .. "/3"
+end
+
+--=========== 诊断：一次性把关键状态打进日志（截图直接看）===========
+function Script:Diagnose()
+    bindSelf(self)
+    D("======== 诊断开始 ========")
+
+    -- 1. 运行环境
+    local bitN = 0
+    if type(bit) == "table" then
+        for _ in pairs(bit) do bitN = bitN + 1 end
+    end
+    D("1 环境: bit=" .. tostring(type(bit)) .. "(" .. bitN .. "函数)" ..
+      " os.date=" .. tostring(type(os) == "table" and type(os.date)) ..
+      " os.time=" .. tostring(type(os) == "table" and type(os.time)) ..
+      " os.timeMs=" .. tostring(type(os) == "table" and type(os.timeMs)) ..
+      " os.clock=" .. tostring(type(os) == "table" and type(os.clock)))
+
+    -- 2. tableIds
+    local ids = getIds()
+    if type(ids) ~= "table" then
+        D("2 tableIds: 【错】不是数组，type=" .. tostring(type(ids)))
+        D("======== 诊断结束 ========")
+        return "tableIds 未配置"
+    end
+    D("2 tableIds: " .. #ids .. " 个 -> " .. tostring(ids[1]) .. " ... " .. tostring(ids[#ids]))
+
+    -- 3. 逐个表探测（关键：比对"期望行数" vs "实际行数"，
+    --    能直接抓出"导入了旧版数据/行数被截断/表 ID 串位"）
+    local expectRows = {}
+    for b = 0, NBUCKET - 1 do
+        local m = MANIFEST[b]
+        if m then
+            local ti = m[1]
+            if not expectRows[ti] or m[3] > expectRows[ti] then expectRows[ti] = m[3] end
+        end
+    end
+    local badTables = 0
+    for i = 1, #ids do
+        local tid = ids[i]
+        local rows = readTable(tid)
+        local exp = expectRows[i - 1] or 0
+        if not rows then
+            D("3 表[" .. i .. "] " .. tostring(tid) .. " 【读不到】期望" .. exp .. "行")
+            badTables = badTables + 1
+        else
+            local r1 = rows[1]
+            local cols = r1 and #r1 or 0
+            local f1 = r1 and pickField(r1) or ""
+            local pv = {}
+            if r1 then
+                for k = 1, math.min(cols, 4) do
+                    pv[#pv + 1] = "[" .. k .. "]" .. string.sub(tostring(r1[k]), 1, 18)
+                end
+            end
+            local h0 = rows[1] and pickField(rows[1])
+            local off = 1
+            if type(h0) == "string" and string.sub(h0, 1, 5) == "LLM1|" then off = 2 end
+            local dataRows = #rows - (off - 1)
+            local mark = ""
+            if dataRows < exp then
+                mark = " 【行数不足!少" .. (exp - dataRows) .. "行】"
+                badTables = badTables + 1
+            elseif dataRows > exp + 2 then
+                mark = " 【行数偏多" .. (dataRows - exp) .. "】"
+            end
+            D("3 表[" .. i .. "] " .. tostring(tid) .. " 总行" .. #rows ..
+              " 数据行" .. dataRows .. " 期望" .. exp .. " 列" .. cols .. mark)
+            D("    首行各列: " .. table.concat(pv, " "))
+            D("    取值=" .. string.sub(f1, 1, 34))
+            if #rows == 0 then badTables = badTables + 1 end
+        end
+    end
+    if badTables > 0 then
+        D("3 【结论】有 " .. badTables .. " 个表状态异常，见上方标记")
+    end
+
+    -- 4. 桶加载统计
+    local okN, failN = 0, 0
+    local firstFails = {}
+    for b = 0, NBUCKET - 1 do
+        local r = loadBucket(b)
+        if r and r ~= false then okN = okN + 1 else
+            failN = failN + 1
+            if #firstFails < 5 then
+                firstFails[#firstFails + 1] = "桶" .. b .. ":" .. tostring(BUCKET_FAIL[b])
+            end
+        end
+    end
+    D("4 桶加载: 成功 " .. okN .. " / 失败 " .. failN .. " / 共 " .. NBUCKET)
+    for i = 1, #firstFails do D("    失败样例 " .. firstFails[i]) end
+
+    -- 5. 单字权重
+    local cn = 0
+    for _ in pairs(CIDF) do cn = cn + 1 end
+    D("5 单字权重: " .. cn .. " 个")
+
+    -- 6. 实检一句话
+    local sess = getSession("__diag__")
+    local best, sc, scanned = retrieve("你好", sess)
+    D("6 检索'你好': 分=" .. string.format("%.4f", sc or 0) ..
+      " 扫=" .. tostring(scanned) .. " 命中=" .. tostring(best and best[1]))
+    local best2, sc2 = retrieve("讲个笑话", sess)
+    D("6 检索'讲个笑话': 分=" .. string.format("%.4f", sc2 or 0) ..
+      " 命中=" .. tostring(best2 and best2[1]))
+
+    D("======== 诊断结束 ========")
+    if badTables > 0 then return "有 " .. badTables .. " 个表读不到" end
+    if okN == 0 then return "所有桶都加载失败" end
+    return "表" .. #ids .. " 桶" .. okN .. "/" .. NBUCKET .. " 权重" .. cn
+end
+
+--=========== 单桶深度诊断：把某个桶的每一步都打出来 ===========
+function Script:DiagBucket(bid)
+    bid = math.floor(tonumber(bid) or 0)
+    D("---- 桶 " .. bid .. " 深度诊断 ----")
+    local m = MANIFEST[bid]
+    if not m then D("  manifest 无此桶"); return "无此桶" end
+    local ti, r0, r1 = m[1], m[2], m[3]
+    D("  manifest: 表索引=" .. ti .. " 行范围=" .. r0 .. ".." .. (r1 - 1) .. " (" .. (r1 - r0) .. "行)")
+    local tid = getTableId(ti + 1)
+    if not tid then D("  tableIds[" .. (ti + 1) .. "] 不存在"); return "无表ID" end
+    D("  表ID=" .. tostring(tid))
+    local rows = readTable(tid)
+    if not rows then D("  读表失败"); return "读表失败" end
+    D("  表行数=" .. #rows .. " 首行列数=" .. tostring(rows[1] and #rows[1] or 0))
+
+    local off = 1
+    local h0 = rows[1] and pickField(rows[1])
+    if type(h0) == "string" and string.sub(h0, 1, 5) == "LLM1|" then off = 2 end
+    D("  表头=" .. tostring(h0) .. " -> 偏移 off=" .. off)
+
+    local chunks, miss = {}, 0
+    for r = r0 + off, r1 + off - 1 do
+        local row = rows[r]
+        local v = row and pickField(row)
+        if v then chunks[#chunks + 1] = v else miss = miss + 1 end
+    end
+    D("  取到字符块=" .. #chunks .. " 缺失行=" .. miss)
+    if miss > 0 then
+        -- 打印一个确实存在的行，看看真实内容
+        local rr = rows[r0 + off]
+        if rr then
+            local pv = {}
+            for k = 1, #rr do pv[#pv + 1] = "[" .. k .. "]" .. string.sub(tostring(rr[k]), 1, 16) end
+            D("  第" .. (r0 + off) .. "行实际: " .. table.concat(pv, " "))
+        end
+        D("  【越界】需要行 " .. (r0 + off) .. ".." .. (r1 + off - 1) .. " 但表只有 " .. #rows .. " 行")
+    end
+    local b85 = table.concat(chunks)
+    D("  Base85 长度=" .. #b85 .. " 首24=" .. string.sub(b85, 1, 24))
+    local ok2, raw = pcall(function() return Inflater.inflate(b85Decode(b85), 3) end)
+    if not ok2 then D("  inflate 异常: " .. tostring(raw)); return "inflate异常" end
+    if not raw or #raw == 0 then D("  inflate 返回空"); return "inflate空" end
+    D("  解压后 " .. #raw .. " 字节 首40=" .. string.sub(raw, 1, 40))
+    local n = 0
+    for _ in string.gmatch(raw, "[^\2]+") do n = n + 1 end
+    D("  条目数=" .. n)
+    return "桶" .. bid .. " 条目" .. n
+end
+
+--=========== 列出加载失败的桶 ===========
+function Script:FailedBuckets()
+    local n = 0
+    local out = {}
+    for b = 0, NBUCKET - 1 do
+        if BUCKETS[b] == false or BUCKETS[b] == nil then
+            n = n + 1
+            if #out < 10 then out[#out + 1] = tostring(b) .. ":" .. tostring(BUCKET_FAIL[b] or "未加载") end
+        end
+    end
+    for i = 1, #out do D("[LLM-D] 失败桶 " .. out[i]) end
+    return "失败桶 " .. n .. " / " .. NBUCKET
+end
+
+function Script:ResetSession(sessionId)
+    local sid = tostring(sessionId or "default")
+    SESSIONS[sid] = nil
+    for i = 1, #SESSION_ORDER do
+        if SESSION_ORDER[i] == sid then
+            table.remove(SESSION_ORDER, i)
+            break
+        end
+    end
+    return true
+end
+
+function Script:GetSessionInfo(sessionId)
+    local sid = tostring(sessionId or "default")
+    local s = SESSIONS[sid]
+    if not s then return "会话「" .. sid .. "」不存在" end
+    local lines = {}
+    for i, t in ipairs(s.turns) do
+        lines[#lines + 1] = string.format("%d. 你: %s\n   答: %s", i, t[1], t[2])
+    end
+    return string.format("会话 %s 共 %d 轮，上次匹配分 %.4f\n%s",
+        sid, #s.turns, s.lastScore or 0, table.concat(lines, "\n"))
+end
+
+function Script:ModelStats()
+    bindSelf(self)
+    local loaded = 0
+    for _ in pairs(BUCKETS) do loaded = loaded + 1 end
+    local tables = 0
+    local ids = getIds()
+    for _ in ipairs(ids) do tables = tables + 1 end
+    local chars = 0
+    for _ in pairs(CIDF) do chars = chars + 1 end
+    return string.format(
+        "模型：%d 个二维表 / %d 个桶 / 已加载 %d 桶 / 单字权重 %d 个\n" ..
+        "参数：topBuckets=%s minScore=%s contextTurns=%s replyMaxLen=%s\n" ..
+        "资料库：kbMinScore=%s | 缓存：cacheMinScore=%s 上限%s 好评线%s",
+        tables, NBUCKET, loaded, chars,
+        tostring(getNumProp("topBuckets", 6)),
+        tostring(getNumProp("minScore", 0.16)),
+        tostring(getNumProp("contextTurns", 2)),
+        tostring(getNumProp("replyMaxLen", 60)),
+        tostring(getNumProp("kbMinScore", 0.35)),
+        tostring(getNumProp("cacheMinScore", 0.55)),
+        tostring(getNumProp("cacheMax", 300)),
+        tostring(getNumProp("rateGood", 4)))
+end
+
+function Script:ProbeTable(tableId)
+    bindSelf(self)
+    local rows = readTable(tableId)
+    if not rows then return "读取失败: " .. tostring(tableId) end
+    local n = #rows
+    local r1 = rows[1]
+    local f1 = r1 and pickField(r1) or ""
+    local cols = r1 and #r1 or 0
+    -- 逐列预览第 1 行，用来判断哪一列才是数据
+    local preview = {}
+    if r1 then
+        for i = 1, cols do
+            preview[#preview + 1] = string.format("[%d]%s", i, string.sub(tostring(r1[i]), 1, 24))
+        end
+    end
+    local r2 = rows[2] and pickField(rows[2]) or ""
+    return string.format("表 %s: %d 行 / 每行 %d 列\n第1行各列: %s\n取值(第1行)=%s\n取值(第2行)=%s",
+        tostring(tableId), n, cols, table.concat(preview, "  "),
+        string.sub(f1, 1, 40), string.sub(r2, 1, 40))
+end
+
+--=========== 给当前 AI 的回答打分 ===========
+-- 参考本地 AI 对话工作台的评分条：好评就把这条回答记住（写进缓存，
+-- 下次同样的问题直接复用）；差评就忘掉它并拉黑，下次换一个答案。
+-- 评分：1-5（>=好评分数线算好评，<=2 算差评），也接受 -1 表示差评。
+function Script:RateReply(sessionId, score)
+    bindSelf(self)
+    local ok, res = pcall(function()
+        local sess = getSession(tostring(sessionId or "default"))
+        local n = tonumber(score)
+        if n == nil then
+            return "评分无效：请传数字（1-5 分，或 -1 表示差评）"
+        end
+        if n < 0 then n = 1 end
+        if n > 5 then n = 5 end
+        n = math.floor(n + 0.5)
+        if n < 1 then n = 1 end
+
+        local q = sess.lastQuery
+        local a = sess.lastRawReply or sess.lastReply
+        if type(q) ~= "string" or q == "" then
+            return "当前会话还没有可以评分的回答，先聊一句再打分"
+        end
+
+        sess.rated = sess.rated or {}
+        sess.rated[#sess.rated + 1] = n
+        RATE_SUM = RATE_SUM + n
+        RATE_CNT = RATE_CNT + 1
+        local sum, cnt = 0, 0
+        for _, v in ipairs(sess.rated) do sum = sum + v; cnt = cnt + 1 end
+
+        local good = getNumProp("rateGood", 4)
+        local ck = normKey(q)
+        if n >= good then
+            -- 好评：按 1.0 分写进缓存，等于用户亲手标定这条答案
+            if type(a) == "string" and a ~= "" then
+                acachePut(ck, a, 1.0, "评分")
+                return string.format("已记住（%d 分）：下次再问「%s」直接这样答。本会话均分 %.1f（%d 次）",
+                    n, q, sum / cnt, cnt)
+            end
+            return string.format("已记录 %d 分，但当前回答为空，没写入缓存", n)
+        elseif n <= 2 then
+            -- 差评：忘掉缓存里的这条 + 拉黑，下次换别的答案
+            ACACHE[ck] = nil
+            if type(a) == "string" then
+                sess.used[q .. "\1" .. a] = true
+                sess.usedCount = (sess.usedCount or 0) + 1
+            end
+            return string.format("已忘掉（%d 分）：下次换个答法。本会话均分 %.1f（%d 次）",
+                n, sum / cnt, cnt)
+        end
+        return string.format("已记录 %d 分（一般）。本会话均分 %.1f（%d 次）", n, sum / cnt, cnt)
+    end)
+    if not ok then
+        D("RateReply 异常: " .. tostring(res))
+        return "打分没成功，内部出错了"
+    end
+    return res
+end
+
+--=========== 运行时追加资料（增量，不全量重建）===========
+-- 只把新条目放进 KB_DELTA，检索时和已压缩的主库一起扫。
+-- 攒到 KB_DELTA_MAX(64) 条才做一次全量重建+合并，
+-- 所以连续追加是 O(1)，不会每加一条就把整库重压一遍。
+function Script:AddKnowledge(text)
+    bindSelf(self)
+    local ok, res = pcall(function()
+        local raw = tostring(text or "")
+        raw = string.gsub(raw, "^%s+", "")
+        raw = string.gsub(raw, "%s+$", "")
+        if raw == "" then return "资料为空，没添加" end
+        local qs, a = kbParseLine(raw)
+        if not qs or not a then return "资料格式不对，应该像『问法|答案』" end
+        KB_DELTA = KB_DELTA or {}
+        -- 先尝试合并进 delta 里答案相同的条目
+        local merged = false
+        for _, it in ipairs(KB_DELTA) do
+            if it.a == a then
+                local seen = {}
+                for _, q in ipairs(it.qs) do seen[q] = true end
+                for _, q in ipairs(qs) do
+                    if not seen[q] then seen[q] = true; it.qs[#it.qs + 1] = q end
+                end
+                merged = true
+                break
+            end
+        end
+        if not merged then
+            -- 也看看主库里有没有这个答案，有就补问法
+            if KB_AIDX and KB_AIDX[a] then
+                local it = KB_ITEMS[KB_AIDX[a]]
+                local seen = {}
+                for _, q in ipairs(it.qs) do seen[q] = true end
+                local added = 0
+                for _, q in ipairs(qs) do
+                    if not seen[q] then seen[q] = true; it.qs[#it.qs + 1] = q; added = added + 1 end
+                end
+                kbReindex()
+                return string.format("已给已有答案补 %d 个问法（共 %d 条资料）", added, #KB_ITEMS)
+            end
+            KB_DELTA[#KB_DELTA + 1] = { qs = qs, a = a }
+        end
+        local dn = #KB_DELTA
+        if dn >= KB_DELTA_MAX then
+            local n = kbBuild()
+            return string.format("已追加并重建（攒满 %d 条）：资料库 %d 条", dn, n)
+        end
+        local total = (KB_ITEMS and #KB_ITEMS or 0) + dn
+        return string.format("已追加（增量 %d 条待合并）：资料库共 %d 条", dn, total)
+    end)
+    if not ok then return "添加资料失败: " .. tostring(res) end
+    return res
+end
+
+function Script:ClearKnowledge()
+    bindSelf(self)
+    KB_DELTA = nil
+    KB_ITEMS = nil
+    KB_BLOB = nil
+    KB_AIDX, KB_QIDX = nil, nil
+    KB_RAW_BYTES, KB_ZIP_BYTES, KB_DICT_N, KB_QN = 0, 0, 0, 0
+    -- 顺手把持久化属性也清掉，否则下次启动又从 kbData 恢复回来，
+    -- 用户会以为"清空没生效"。脚本改不了属性面板的显示值，
+    -- 但运行时的读取源清掉就够，属性面板里那段文本请手动删掉。
+    if COMPONENT_SELF ~= nil then
+        pcall(function() COMPONENT_SELF.kbData = "" end)
+    end
+    pcall(function() Script.kbData = "" end)
+    kbBuild()
+    return "资料库已清空。注意：属性面板 knowledgeBase / kbText / kbData 里填的内容"
+        .. "下次启动会重新载入，要彻底清请把属性里的文本也删掉"
+end
+
+--=========== 资料库持久化：导出/导入（压缩后 Base85 文本）===========
+function Script:ExportKnowledge()
+    bindSelf(self)
+    local ok, res = pcall(function()
+        -- 导出前先全量重建，保证 delta 也编进去
+        if KB_DELTA and #KB_DELTA > 0 then kbBuild() end
+        if not KB_BLOB or KB_BLOB == "" then return "" end
+        return b85Encode(KB_BLOB)
+    end)
+    if not ok then return "" end
+    return res
+end
+
+function Script:ImportKnowledge(text)
+    bindSelf(self)
+    local ok, res = pcall(function()
+        local t = tostring(text or "")
+        if t == "" then return "导入文本为空" end
+        -- 两种输入都收：
+        --   ① 导出缓存/资料库得到的 b85 持久化文本（magic 是 KB2）
+        --   ② 直接粘的明文，每行一条『问法|问法|...|答案』
+        local items = nil
+        local okd, blob = pcall(function() return b85Decode(t) end)
+        if okd and type(blob) == "string" and string.sub(blob, 1, 3) == "KB2" then
+            items = kbDecompress(blob)
+        end
+        if (not items or #items == 0) then
+            local plain = {}
+            for rawline in string.gmatch(t, "[^\r\n]+") do
+                local qs, a = kbParseLine(rawline)
+                if qs and a and a ~= "" then
+                    local it = { qs = qs, a = a }
+                    plain[#plain + 1] = it
+                end
+            end
+            if #plain > 0 then items = plain end
+        end
+        if not items or #items == 0 then
+            return "导入失败：既不是资料库导出文本，也没解析出有效条目（每行应为『问法|答案』）"
+        end
+        -- 与现有资料合并（按答案去重用 kbMerge）
+        local list = {}
+        if KB_ITEMS then
+            for _, it in ipairs(KB_ITEMS) do list[#list + 1] = kbItemToStr(it) end
+        end
+        if KB_DELTA then
+            for _, it in ipairs(KB_DELTA) do list[#list + 1] = kbItemToStr(it) end
+        end
+        for _, it in ipairs(items) do list[#list + 1] = kbItemToStr(it) end
+        KB_DELTA = nil
+        local merged = kbMerge(list)
+        local b2, dict = kbCompress(merged)
+        KB_ITEMS = merged
+        KB_BLOB = b2
+        KB_ZIP_BYTES = #b2
+        KB_DICT_N = #dict
+        KB_RAW_BYTES = 0
+        for _, it in ipairs(merged) do
+            KB_RAW_BYTES = KB_RAW_BYTES + #kbItemToStr(it)
+        end
+        kbReindex()
+        return string.format("已导入并合并，资料库 %d 条 / %d 个问法", #merged, KB_QN)
+    end)
+    if not ok then return "导入失败: " .. tostring(res) end
+    return res
+end
+
+--=========== 缓存导出 / 导入 / 清空 ===========
+function Script:ExportCache()
+    bindSelf(self)
+    local ok, res = pcall(function()
+        if ACACHE_N == 0 then return "" end
+        return b85Encode(acacheSerialize())
+    end)
+    if not ok then return "" end
+    return res
+end
+
+function Script:ImportCache(text)
+    bindSelf(self)
+    local ok, res = pcall(function()
+        local n = acacheLoadText(tostring(text or ""))
+        return "已导入缓存 " .. n .. " 条，当前共 " .. ACACHE_N .. " 条"
+    end)
+    if not ok then return "导入失败: " .. tostring(res) end
+    return res
+end
+
+function Script:ClearCache()
+    bindSelf(self)
+    ACACHE = {}
+    ACACHE_ORDER = {}
+    ACACHE_N = 0
+    return "缓存已清空"
+end
+
+--=========== 资料库与缓存统计 ===========
+function Script:KbStats()
+    bindSelf(self)
+    local ok, res = pcall(function()
+        local kbN = KB_ITEMS and #KB_ITEMS or 0
+        local saveTxt = "尚未压缩"
+        if KB_RAW_BYTES > 0 then
+            local ratio = (1 - KB_ZIP_BYTES / KB_RAW_BYTES) * 100
+            -- 条数少时词典开销大于收益，如实说"未回本"，不要显示负省率误导
+            if ratio > 0 then
+                saveTxt = string.format("省 %.0f%%", ratio)
+            else
+                saveTxt = string.format("词典开销未回本 +%.0f%%，条目多才划算", -ratio)
+            end
+        end
+        local avg = 0
+        if RATE_CNT > 0 then avg = RATE_SUM / RATE_CNT end
+        local dn = KB_DELTA and #KB_DELTA or 0
+        local dt = dn > 0 and string.format("，待合并增量 %d 条", dn) or ""
+        return string.format(
+            "资料库 %d 条 / %d 个问法%s | 原始 %.1fKB -> 压缩 %.1fKB（%s，词典 %d 词）\n" ..
+            "回答缓存 %d/%d 条 | 全局评分 %.2f 分（%d 次）\n" ..
+            "分词复用缓存 %d 条 | 二维表 %d 个",
+            kbN, KB_QN, dt, KB_RAW_BYTES / 1024, KB_ZIP_BYTES / 1024, saveTxt, KB_DICT_N,
+            ACACHE_N, math.floor(getNumProp("cacheMax", 300)), avg, RATE_CNT,
+            TOKEN_N, #getIds())
+    end)
+    if not ok then return "统计失败: " .. tostring(res) end
+    return res
+end
+
+function Script:OnStart()
+    -- 第一行就保存实例引用：属性都在 self 上，
+    -- 后面所有 getIds() 都靠它读到真实配置。
+    COMPONENT_SELF = self
+    SESSIONS = {}
+    SESSION_ORDER = {}
+    BUCKETS = {}
+    TABLE_CACHE = {}
+    BUCKET_FAIL = {}
+    seedRandom(nowSec())
+    -- 资料库：优先从持久化文本恢复，否则读属性重建
+    local persisted = nil
+    local selfk = COMPONENT_SELF
+    if selfk ~= nil then
+        local ok, v = pcall(function() return selfk.kbData end)
+        if ok and type(v) == "string" then persisted = v end
+    end
+    if persisted == nil then persisted = rawget(Script, "kbData") end
+    local kbN
+    if type(persisted) == "string" and persisted ~= "" then
+        kbN = kbLoadPersisted(persisted)
+        if kbN > 0 then
+            D(string.format("【启动】资料库从持久化恢复 %d 条 / %d 个问法（%.1fKB）",
+                kbN, KB_QN, KB_ZIP_BYTES / 1024))
+        end
+    end
+    if not kbN or kbN == 0 then
+        kbN = kbBuild()
+        if kbN > 0 then
+            D(string.format("【启动】资料库 %d 条 / %d 个问法，%.1fKB -> %.1fKB（省 %.0f%%，词典 %d）",
+                kbN, KB_QN, KB_RAW_BYTES / 1024, KB_ZIP_BYTES / 1024,
+                KB_RAW_BYTES > 0 and ((1 - KB_ZIP_BYTES / KB_RAW_BYTES) * 100) or 0,
+                KB_DICT_N))
+        end
+    end
+    -- 回答缓存：从属性里的持久化文本恢复
+    acacheLoad()
+    -- 先把 ID 来源打出来：属性没生效时一眼看出走的是内置默认
+    local ids0 = getIds()
+    D("【启动】二维表ID来源=" .. IDS_SOURCE .. " 共" .. #ids0 .. "个")
+    if #ids0 < 14 then
+        D("【启动】ID 只有 " .. #ids0 .. " 个，需要 14 个")
+    end
+    -- 启动时自检：表读不到 / 桶全挂，立刻打进日志，不用等到对话才发现
+    if Script.autoDiag ~= false then
+        local ids = getIds()
+        if type(ids) ~= "table" or #ids == 0 then
+            D("【启动自检】tableIds 为空，模型数据没配置")
+        else
+            -- 期望数据行数（manifest 里每个表的最大结束行）
+            local expectRows = {}
+            for b = 0, NBUCKET - 1 do
+                local m = MANIFEST[b]
+                if m then
+                    local ti = m[1]
+                    if not expectRows[ti] or m[3] > expectRows[ti] then expectRows[ti] = m[3] end
+                end
+            end
+            local okT, badT, shortT = 0, {}, {}
+            for i = 1, #ids do
+                local rows = readTable(ids[i])
+                if not rows then
+                    badT[#badT + 1] = tostring(ids[i])
+                else
+                    okT = okT + 1
+                    local h0 = rows[1] and pickField(rows[1])
+                    local off = 1
+                    if type(h0) == "string" and string.sub(h0, 1, 5) == "LLM1|" then off = 2 end
+                    local dr = #rows - (off - 1)
+                    local exp = expectRows[i - 1] or 0
+                    if dr < exp then
+                        shortT[#shortT + 1] = "表[" .. i .. "]" .. tostring(ids[i]) ..
+                            " 只有" .. dr .. "行/期望" .. exp
+                    end
+                end
+            end
+            D("【启动自检】二维表可读 " .. okT .. "/" .. #ids)
+            if #badT > 0 then
+                D("  读不到: " .. table.concat(badT, ", "))
+            end
+            if #shortT > 0 then
+                D("  【行数不足】" .. #shortT .. " 个表数据被截断: " .. table.concat(shortT, "; "))
+                D("  -> 多半是导入时行数被限制或数据版本不对")
+            end
+            -- 试加载 3 个桶，看数据管线通不通
+            local okB = 0
+            for _, b in ipairs({255, 0, 1}) do
+                if loadBucket(b) then okB = okB + 1 end
+            end
+            D("【启动自检】抽样桶加载 " .. okB .. "/3" ..
+              (okB == 0 and " 【数据管线不通，请调 Diagnose】" or ""))
+        end
+    end
+    if getProp("preloadNG") == true then loadNG() end
+    if Script.autoLoad ~= false then
+        -- 预加载若干高频桶，降低首轮延迟（可选）
+        local preload = math.floor(tonumber(Script.preloadBuckets) or 0)
+        for i = 0, preload - 1 do
+            loadBucket(i % NBUCKET)
+        end
+    end
+    return true
+end
+
+-- 组件销毁时清掉缓存，避免重新加载后残留旧会话
+function Script:OnDestroy()
+    SESSIONS = {}
+    SESSION_ORDER = {}
+    BUCKETS = {}
+    TABLE_CACHE = {}
+    ACACHE = {}
+    ACACHE_ORDER = {}
+    ACACHE_N = 0
+    KB_ITEMS = nil
+    KB_BLOB = nil
+    KB_DELTA = nil
+    KB_AIDX, KB_QIDX = nil, nil
+    TOKEN_CACHE = {}
+    TOKEN_ORDER = {}
+    TOKEN_N = 0
+    return true
+end
+
+
+_G.KB = { retrieve = kbRetrieve, items = function() return KB_ITEMS end, delta = function() return KB_DELTA end }
+
+_G.KB = { retrieve = kbRetrieve, items = function() return KB_ITEMS end, delta = function() return KB_DELTA end, enc = b85Encode, dec = b85Decode, decmp = kbDecompress, blob = function() return KB_BLOB end }
+return Script
