@@ -4,7 +4,8 @@
 -- 用法：
 --   1. 把模型数据导入 14 个二维表，ID 依次为 llm_data_1 .. llm_data_14
 --      （每个表 ≤2000 行、≤512KB，数据已是 Base85 可打印文本）
---   2. 组件属性 tableIds 里按顺序填好这些 ID
+--   2. 组件属性 tableIds（字符串数组）里按 1..14 顺序填好这些 ID（已预置默认）
+--      换地图/重导二维表后 ID 会变，可用 SetId(槽位, 新ID) 单独覆盖，不用改属性面板
 --   3. 触发器里调：Script:Chat("会话ID", "用户说的话")  返回回复文本
 --
 -- 开放函数：
@@ -16,6 +17,8 @@
 --   Unteach(q) / TaughtList(n)   忘掉 / 列出教过的内容
 --   Dislike(sessionId)           上一句答得不好（扣信誉+换备选）
 --   CacheBad(n) / PurgeBad(th)   看差评条目 / 清掉低信誉条目
+--   SetId(slot, tableId)         覆盖第 slot 张表 ID（slot=0 恢复用属性）
+--   SetNgId(slot, tableId)       覆盖生成模型第 slot 张表 ID
 --   KbStats()                    资料库与缓存统计
 --   ResetSession(sessionId)      清空某会话历史
 --   GetSessionInfo(sessionId)    查看会话记录（调试）
@@ -34,9 +37,12 @@
 --   换种说法问也能命中。内部做 bigram 词典压缩 + 增量储存。
 --   也可在触发器里用 AddKnowledge 运行时追加（增量，不全量重建）。
 --
--- 回答缓存（新增）：高分回答自动记住，下次同样的问题零耗时返回；
---   用 RateReply 给回答打分，好评强制记住、差评忘掉并换一条。
---   缓存可以用 导出缓存 导出文本，粘进 answerCache 属性实现持久化。
+-- 回答缓存（评分降级）：高分回答自动记住，下次同样的问题零耗时返回。
+--   信誉 rep = 命中次数 - 差评×3；rep<0 自动退位，备选池顶上，不会被锁死。
+--   连问同一句到 teachAt 次 -> 反问玩家要答案，玩家给了就当高分答案记住
+--   （同样能被差评降级，不会永久锁死）。
+--   缓存用 导出缓存 导出文本粘进 answerCache 属性持久化；
+--   存档带版本头 ACv2，旧版存档一律丢弃（不做兼容）。
 --
 -- 数据规模：14 个二维表 / 256 个桶 / 4000 个单字权重
 --           另有生成模型 3 个二维表（字符 3-gram 统计模型）
@@ -45,11 +51,29 @@ local Script = {}
 
 Script.propertys = {
     --==================== 【一】语料二维表（必填）====================
-    tableIdsText = {
-        type = Mini.String,
-        default = "v7692856137548737533110822,v7692856244922919933110824,v7692856300757494781110826,v7692856339412200445110828,v7692856378066906109110830,v7692856421016579069110832,v7692856459671284733110834,v7692856502620957693110836,v7692856545570630653110838,v7692856575635401725110840,v7692856601405205501110842,v7692856631469976573110844,v7692856661534747645110846,v7692856691599518717110848",
-        displayName = "语料表ID组(14张·逗号分隔)",
-        tips = "25 万条语料所在的 14 个二维表 ID，按顺序填，英文逗号分隔。留空则用内置默认 ID"
+    tableIds = {
+        type = Mini.Array,
+        itemType = Mini.String,
+        maxNum = 32,
+        default = Mini.Array(Mini.String,
+            "v7692856137548737533110822",
+            "v7692856244922919933110824",
+            "v7692856300757494781110826",
+            "v7692856339412200445110828",
+            "v7692856378066906109110830",
+            "v7692856421016579069110832",
+            "v7692856459671284733110834",
+            "v7692856502620957693110836",
+            "v7692856545570630653110838",
+            "v7692856575635401725110840",
+            "v7692856601405205501110842",
+            "v7692856631469976573110844",
+            "v7692856661534747645110846",
+            "v7692856691599518717110848"
+        ),
+        displayName = "语料表ID组(14张)",
+        customDisplayName = "表ID",
+        tips = "25 万条语料所在的 14 个二维表 ID，按 1..14 顺序填。已预置默认，换地图/重导表后需更新"
     },
 
     --==================== 【二】统计生成模型（可选·独立数组）====================
@@ -228,12 +252,6 @@ Script.propertys = {
         default = "",
         displayName = "资料库(持久化·压缩)",
         tips = "把 导出资料库 返回的文本粘进来，下次启动自动加载"
-    },
-    kbText = {
-        type = Mini.String,
-        default = "",
-        displayName = "资料库(文本·备用)",
-        tips = "数组填不了时用它，一条一行"
     },
     kbMinScore = {
         type = Mini.Number,
@@ -419,15 +437,15 @@ Script.openFnArgs = {
         displayName = "资料库与缓存统计",
         params = {}
     },
-    SetTableIds = {
+    SetId = {
         returnType = Mini.String,
         displayName = "设置语料表ID组",
-        params = { "ID组(逗号分隔)", Mini.String }
+        params = { "槽位序号", Mini.Number, "二维表ID", Mini.String }
     },
-    SetNgIds = {
+    SetNgId = {
         returnType = Mini.String,
         displayName = "设置生成表ID组",
-        params = { "ID组(逗号分隔)", Mini.String }
+        params = { "槽位序号", Mini.Number, "二维表ID", Mini.String }
     },
     GetTableIds = {
         returnType = Mini.String,
@@ -1419,20 +1437,10 @@ local DEFAULT_IDS = {
     "v7692856691599518717110848"
 }
 
-local RUNTIME_IDS = nil     -- SetTableIds 运行时覆盖
+local RUNTIME_IDS = nil     -- SetId 运行时覆盖
 local IDS_SOURCE  = "未解析" -- 记录本次用的是哪一路
 local IDS_LOGGED  = false
 
--- 逗号分隔字符串 -> 数组（兼容中文逗号、分号、空格、换行）
-local function splitIds(str)
-    local out = {}
-    for part in string.gmatch(str, "[^,，;；%s]+") do
-        local v = string.gsub(part, "^%s+", "")
-        v = string.gsub(v, "%s+$", "")
-        if v ~= "" then out[#out + 1] = v end
-    end
-    return out
-end
 
 -- 尝试把"数组包装对象"拆成 Lua 表（部分版本数组属性是 userdata 包装）
 -- 数组属性可能是：普通 Lua 表 / 带 values 的包装 / userdata(元表 __index)。
@@ -1501,66 +1509,27 @@ local function bindSelf(s)
 end
 
 -- 统一解析 14 个二维表 ID。优先级：
---   1) 运行时 SetTableIds 设的
---   2) 组件实例 self 上的属性（官方标准访问方式）
---   3) 模板表 Script 上的属性（兼容旧行为）
---   4) 内置默认值
--- 无论走哪条都返回可用数组，绝不返回 nil。
+--   1) 运行时 SetId 覆盖的
+--   2) 组件属性 tableIds（字符串数组，唯一正式来源）
+--   3) 内置默认值
+-- 不再支持逗号分隔字符串；无论走哪条都返回可用数组，绝不返回 nil。
 local function getIds()
     if RUNTIME_IDS and #RUNTIME_IDS > 0 then
-        IDS_SOURCE = "运行时SetTableIds(" .. #RUNTIME_IDS .. ")"
+        IDS_SOURCE = "运行时覆盖(" .. #RUNTIME_IDS .. ")"
         return RUNTIME_IDS
     end
+    -- 唯一来源：组件属性 tableIds（字符串数组）。不再支持逗号分隔字符串。
+    local arr = nil
     local self_ = COMPONENT_SELF
     if self_ ~= nil then
-        -- 字符串属性
-        local okS, raw = pcall(function() return self_.tableIdsText end)
-        if okS and type(raw) == "string" and raw ~= "" then
-            local t = splitIds(raw)
-            if #t > 0 then
-                IDS_SOURCE = "实例属性tableIdsText(" .. #t .. ")"
-                return t
-            end
-        end
-        if okS and type(raw) == "table" then
-            local t = unwrapArray(raw)
-            if t and #t > 0 then
-                IDS_SOURCE = "实例属性tableIdsText(表" .. #t .. ")"
-                return t
-            end
-        end
-        -- 数组属性（Mini.Array，可能是 userdata 包装）
-        local okA, arr = pcall(function() return self_.tableIds end)
-        if okA and arr ~= nil then
-            local t = unwrapArray(arr)
-            if t and #t > 0 then
-                IDS_SOURCE = "实例属性tableIds(数组" .. #t .. ")"
-                return t
-            end
-        end
+        local ok, v = pcall(function() return self_.tableIds end)
+        if ok and v ~= nil then arr = v end
     end
-    local raw = rawget(Script, "tableIdsText")
-    if type(raw) == "string" and raw ~= "" then
-        local t = splitIds(raw)
-        if #t > 0 then
-            IDS_SOURCE = "属性tableIdsText(" .. #t .. ")"
-            return t
-        end
-    end
-    if type(raw) == "table" then
-        local t = unwrapArray(raw)
-        if t and #t > 0 then
-            IDS_SOURCE = "属性tableIdsText(表" .. #t .. ")"
-            return t
-        end
-    end
-    local arr = rawget(Script, "tableIds")
-    if arr ~= nil then
-        local t = unwrapArray(arr)
-        if t and #t > 0 then
-            IDS_SOURCE = "属性tableIds(数组" .. #t .. ")"
-            return t
-        end
+    if arr == nil then arr = rawget(Script, "tableIds") end
+    local t = unwrapArray(arr)
+    if t and #t > 0 then
+        IDS_SOURCE = "属性tableIds(数组" .. #t .. ")"
+        return t
     end
     IDS_SOURCE = "内置默认(14)"
     return DEFAULT_IDS
@@ -1574,29 +1543,36 @@ local function getTableId(idx)
         TABLE_ID_NIL_LOGGED = true
         D("【缺ID】第 " .. idx .. " 个为空，当前来源=" .. IDS_SOURCE ..
           " 共" .. #ids .. "个。需要 14 个：llm_data_1 .. llm_data_14")
-        D("  -> 可用开放函数 SetTableIds(\"id1,id2,...\") 直接指定")
+        D("  -> 可用开放函数 SetId(槽位序号, \"二维表ID\") 指定，或在属性 tableIds 数组里补")
     end
     return v
 end
 
 -- 运行时指定二维表 ID（绕过组件属性，排障用）
-function Script:SetTableIds(text)
+-- 运行时覆盖单个表 ID（排障用：换地图后二维表 ID 会变，不用改属性面板）
+-- 用法：SetId(3, "v769...") 把第 3 张表换成新 ID；SetId(0) 恢复用属性里的
+function Script:SetId(slot, tableId)
     bindSelf(self)
-    if type(text) ~= "string" or text == "" then
-        D("SetTableIds: 参数为空，未生效")
-        return "参数为空"
+    local n = tonumber(slot)
+    if n == nil or n < 0 then return "用法: SetId(槽位序号, 二维表ID)，序号 1..14" end
+    if n == 0 then
+        RUNTIME_IDS = nil
+        TABLE_CACHE, BUCKETS, BUCKET_FAIL = {}, {}, {}
+        TABLE_ID_NIL_LOGGED = false
+        return "已恢复使用组件属性 tableIds"
     end
-    local t = splitIds(text)
-    if #t == 0 then return "解析出0个ID" end
-    RUNTIME_IDS = t
-    IDS_SOURCE = "运行时SetTableIds(" .. #t .. ")"
-    TABLE_CACHE = {}
-    BUCKETS = {}
-    BUCKET_FAIL = {}
+    if type(tableId) ~= "string" or tableId == "" then return "第 2 个参数应是二维表 ID 字符串" end
+    if RUNTIME_IDS == nil then
+        RUNTIME_IDS = {}
+        local base = getIds()
+        for i = 1, #base do RUNTIME_IDS[i] = base[i] end
+    end
+    RUNTIME_IDS[n] = tableId
+    TABLE_CACHE, BUCKETS, BUCKET_FAIL = {}, {}, {}
     TABLE_ID_NIL_LOGGED = false
-    D("SetTableIds 生效: " .. #t .. " 个 -> " .. t[1] .. " ... " .. t[#t])
-    return "已设置 " .. #t .. " 个ID"
+    return "第 " .. n .. " 张表已设为 " .. tableId .. "（当前共 " .. #RUNTIME_IDS .. " 个）"
 end
+
 
 function Script:GetTableIds()
     bindSelf(self)
@@ -1737,7 +1713,7 @@ local function tokOf(s)
 end
 
 --==================== 资料库（用户自定义 · 压缩式储存）====================
--- 来源：组件属性 knowledgeBase（字符串数组，maxNum=9999）+ kbText（换行分隔文本）
+-- 来源：组件属性 knowledgeBase（字符串数组，maxNum=9999）
 --
 -- 条目格式："问法1|问法2|...|答案"
 --   · 最后一个竖线后面是【答案】，前面全是【问法】——同一答案可以登记多种说法，
@@ -1785,19 +1761,6 @@ local function kbCollect()
             x = string.gsub(x, "^%s+", "")
             x = string.gsub(x, "%s+$", "")
             if x ~= "" then list[#list + 1] = x end
-        end
-    end
-    local txt = nil
-    if self_ ~= nil then
-        local ok, v = pcall(function() return self_.kbText end)
-        if ok and type(v) == "string" then txt = v end
-    end
-    if txt == nil then txt = rawget(Script, "kbText") end
-    if type(txt) == "string" and txt ~= "" then
-        for kblraw in string.gmatch(txt, "[^\r\n]+") do
-            local kbline = string.gsub(kblraw, "^%s+", "")
-            kbline = string.gsub(kbline, "%s+$", "")
-            if kbline ~= "" then list[#list + 1] = kbline end
         end
     end
     return list
@@ -2355,8 +2318,10 @@ local function acacheSwitch(key)
     return pick
 end
 
+local ACACHE_FMT = "ACv2"   -- 存档格式版本：旧版（无版本头）一律丢弃，不做兼容
+
 local function acacheSerialize()
-    local parts = {}
+    local parts = { ACACHE_FMT }
     for _, k in ipairs(ACACHE_ORDER) do
         local e = ACACHE[k]
         if e then
@@ -2380,6 +2345,9 @@ local function acacheLoadText(b85txt)
     -- Base85 按 4 字节分组，不足补 0，解码后末尾会有填充用的 \0。
     -- 不剥掉的话最后一段会挂上一串不可见字符（实测出现过"旧答案\0\0\0"）。
     raw = string.gsub(raw, "%z+$", "")
+    -- 版本校验：必须以 ACv2 开头，旧存档直接整块丢弃（不兼容）
+    if string.sub(raw, 1, #ACACHE_FMT) ~= ACACHE_FMT then return 0 end
+    raw = string.sub(raw, #ACACHE_FMT + 1)
     local n = 0
     for entry in string.gmatch(raw, "[^\2]+") do
         local f, pos, cnt = {}, 1, 0
@@ -2707,14 +2675,7 @@ end
 
 local function getNgIds()
     if RUNTIME_NG_IDS and #RUNTIME_NG_IDS > 0 then return RUNTIME_NG_IDS end
-    local a = ngIdsFromArray()
-    if a then return a end
-    local raw = getProp("ngTableIdsText")
-    if type(raw) == "string" and raw ~= "" then
-        local t = splitIds(raw)
-        if #t > 0 then return t end
-    end
-    return nil
+    return ngIdsFromArray()
 end
 
 local function ngReadVarint(s, p)
@@ -2981,14 +2942,27 @@ local function applyGen(reply, best, userText)
     return bestTxt
 end
 
-function Script:SetNgIds(text)
+-- 运行时覆盖生成模型表（3 张）。SetNgId(槽位, ID)，槽位 0 = 恢复用属性
+function Script:SetNgId(slot, tableId)
     bindSelf(self)
-    if type(text) ~= "string" then return "参数应是字符串" end
-    RUNTIME_NG_IDS = splitIds(text)
-    NG_LOADED = false
-    NG_ERR = nil
-    return "已设置生成表 " .. #RUNTIME_NG_IDS .. " 个"
+    local n = tonumber(slot)
+    if n == nil or n < 0 then return "用法: SetNgId(槽位序号, 二维表ID)，序号 1..3" end
+    if n == 0 then
+        RUNTIME_NG_IDS = nil
+        NG_LOADED, NG_ERR = false, nil
+        return "已恢复使用组件属性 ngTableIds"
+    end
+    if type(tableId) ~= "string" or tableId == "" then return "第 2 个参数应是二维表 ID 字符串" end
+    if RUNTIME_NG_IDS == nil then
+        RUNTIME_NG_IDS = {}
+        local base = getNgIds()
+        if base then for i = 1, #base do RUNTIME_NG_IDS[i] = base[i] end end
+    end
+    RUNTIME_NG_IDS[n] = tableId
+    NG_LOADED, NG_ERR = false, nil
+    return "生成表第 " .. n .. " 张已设为 " .. tableId
 end
+
 
 function Script:Gen(seedText)
     bindSelf(self)
@@ -3784,7 +3758,7 @@ function Script:ClearKnowledge()
     end
     pcall(function() Script.kbData = "" end)
     kbBuild()
-    return "资料库已清空。注意：属性面板 knowledgeBase / kbText / kbData 里填的内容"
+    return "资料库已清空。注意：属性面板 knowledgeBase / kbData 里填的内容"
         .. "下次启动会重新载入，要彻底清请把属性里的文本也删掉"
 end
 
