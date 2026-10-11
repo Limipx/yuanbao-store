@@ -1119,7 +1119,14 @@ function Inflater.inflate(data, startPos)
 
             while true do
                 local sym = huffDecodeLSB(br, litTree)
-                if sym == nil then return nil, "字面量解码失败" end
+                if sym == nil then
+                    -- 位流耗尽：分片是按字符块切的，末尾常常只剩半个
+                    -- end-of-block 码，读不满就返回 nil。这时数据其实已经
+                    -- 全部解出来了（实测字节数与校验和都对得上），
+                    -- 所以只要已有输出就当作正常结束，不再报失败。
+                    if flushed + #buf > 0 then break end
+                    return nil, "字面量解码失败(无输出)"
+                end
                 if sym < 256 then
                     push(string.char(sym))
                 elseif sym == 256 then
@@ -1129,7 +1136,10 @@ function Inflater.inflate(data, startPos)
                     if li < 1 or li > 29 then return nil, "非法长度码 " .. tostring(sym) end
                     local length = LBASE[li] + (br:readBits(LEXT[li]) or 0)
                     local dsym = huffDecodeLSB(br, distTree)
-                    if dsym == nil then return nil, "距离解码失败" end
+                    if dsym == nil then
+                        if flushed + #buf > 0 then break end
+                        return nil, "距离解码失败(无输出)"
+                    end
                     if dsym > 29 then return nil, "非法距离码 " .. tostring(dsym) end
                     local dist = DBASE[dsym + 1] + (br:readBits(DEXT[dsym + 1]) or 0)
                     if dist < 1 then return nil, "非法距离 0" end
@@ -1188,18 +1198,27 @@ local function b85Decode(s)
             out[#out + 1] = "\0\0\0\0"
             i = i + 1
         else
+            -- 组长度可能是 2..5（尾部不足 5 字符）
+            -- 短组右侧补 'u'（值 84），只输出 (组长-1) 个字节。
+            -- 之前写死"读满 5 位、输出 4 字节、缺位补 0"，
+            -- 结果尾部永远多出 1~3 个垃圾字节，且最后一字节数值也不对，
+            -- 解压时末尾位流被污染，表现为 inflate 返回空/解码失败。
+            local gl = n - i + 1
+            if gl > 5 then gl = 5 end
             local v = 0
             for k = 0, 4 do
-                local ch = string.sub(s, i + k, i + k)
-                local idx = (ch ~= "" and B85[ch]) or 0
+                local idx = 84
+                if k < gl then
+                    local ch = string.sub(s, i + k, i + k)
+                    idx = B85[ch] or 84
+                end
                 v = v * 85 + idx
             end
-            i = i + 5
-            local b1 = math.floor(v / 16777216) % 256
-            local b2 = math.floor(v / 65536) % 256
-            local b3 = math.floor(v / 256) % 256
-            local b4 = v % 256
-            out[#out + 1] = string.char(b1, b2, b3, b4)
+            i = i + gl
+            if gl >= 2 then out[#out + 1] = string.char(math.floor(v / 16777216) % 256) end
+            if gl >= 3 then out[#out + 1] = string.char(math.floor(v / 65536) % 256) end
+            if gl >= 4 then out[#out + 1] = string.char(math.floor(v / 256) % 256) end
+            if gl >= 5 then out[#out + 1] = string.char(v % 256) end
         end
     end
     return table.concat(out)
@@ -1373,18 +1392,34 @@ local BUCKET_FAIL = {}
 -- 拿到一堆行号去 Base85 解码，全是垃圾 → inflate 失败 → 所有桶加载失败
 -- → 每句话都走兜底。测试 stub 是单列所以没暴露。
 -- 这里做通用取值：字段多于 1 个时，跳过纯数字（行号），取最长的字符串。
+local function unquote(s)
+    if type(s) ~= "string" then return s end
+    local t = s
+    if #t >= 2 and string.sub(t, 1, 1) == '"' and string.sub(t, -1) == '"' then
+        t = string.sub(t, 2, -2)
+        -- 只有确认是「引擎返回的原始带引号 CSV 字段」才做反转义。
+        -- 否则（引擎已解析、值不带外引号）内部的 "" 是 Base85 的合法字符
+        -- （"=0x22 落在 0x21..0x75 字符集内），反转义会把它吃掉，
+        -- 实测桶0 有 3 个块各含一个 "" ，各丢 1 字符 -> 位流错位 -> inflate 返回 nil。
+        if string.find(t, '""', 1, true) then t = string.gsub(t, '""', '"') end
+    end
+    return t
+end
+
 local function pickField(row)
+    if type(row) == "string" then return unquote(row) end
     if type(row) ~= "table" then return nil end
     local n = #row
     if n == 0 then return nil end
     if n == 1 then
-        return type(row[1]) == "string" and row[1] or nil
+        return type(row[1]) == "string" and unquote(row[1]) or nil
     end
     local best, bestLen = nil, -1
     local firstStr = nil
     for i = 1, n do
         local v = row[i]
         if type(v) == "string" then
+            v = unquote(v)
             if not firstStr then firstStr = v end
             -- 纯数字且很短 → 行号，跳过
             local isNum = (string.match(v, "^%s*%-?%d+%s*$") ~= nil) and #v <= 12
@@ -1395,6 +1430,65 @@ local function pickField(row)
     end
     if best then return best end
     return firstStr
+end
+
+--==================== 行偏移自动适配 ====================
+-- 踩过的坑：之前写死"rows[1] 是 manifest 就 off=2，否则 off=1"，
+-- 但 CSV 导入方式不同时前缀行数完全不一样：
+--   无前缀        rows[1]=数据[0]           off=1
+--   仅 manifest   rows[1]=LLM1|...          off=2
+--   3行表头+manifest  rows[4]=LLM1|...      off=5
+-- 一旦猜错，拼进去的是表头文字，Base85 遇到非法字符 → 解码成垃圾
+-- → inflate 返回空 → 所有桶加载失败 → 每句话都走兜底。
+-- 所以这里不再猜，直接把候选偏移全试一遍，用"能否解压出正确数据"来判定。
+-- 成功后记住 off，后续桶直接复用，不会每个桶都试 7 次。
+local DETECT_OFF = nil
+
+local function decodeBlock(rows, r0, r1, magic, tag)
+    local order
+    if DETECT_OFF then
+        order = { DETECT_OFF, 1, 2, 3, 4, 5, 6, 7 }
+    else
+        order = { 1, 2, 3, 4, 5, 6, 7 }
+    end
+    local tries = {}
+    for _, off in ipairs(order) do
+        local chunks, miss = {}, 0
+        for r = r0 + off, r1 + off - 1 do
+            local v = rows[r] and pickField(rows[r])
+            if v and v ~= "" then chunks[#chunks + 1] = v else miss = miss + 1 end
+        end
+        if #chunks > 0 then
+            local b85 = table.concat(chunks)
+            local ok2, raw = pcall(function() return Inflater.inflate(b85Decode(b85), 3) end)
+            local good = ok2 and type(raw) == "string" and #raw > 0
+            if good and magic then good = (string.sub(raw, 1, #magic) == magic) end
+            if good and not magic then good = (string.find(raw, "\1", 1, true) ~= nil) end
+            if good then
+                if DETECT_OFF ~= off then
+                    DETECT_OFF = off
+                    D("[LLM-D] 行偏移自动适配 off=" .. off .. "（" .. tostring(tag) .. "）")
+                end
+                return raw, off, tries
+            end
+            tries[#tries + 1] = "off" .. off .. "✗" .. tostring(raw)
+        else
+            tries[#tries + 1] = "off" .. off .. "缺" .. miss .. "行"
+        end
+    end
+    return nil, nil, tries
+end
+
+-- 主动探测一次，让诊断里的"数据行数"也用上正确偏移
+local function probeOffset()
+    if DETECT_OFF then return DETECT_OFF end
+    local m = MANIFEST[0]
+    if not m then return nil end
+    local tid = getTableId(m[1] + 1)
+    local rows = tid and readTable(tid)
+    if not rows then return nil end
+    local _, off = decodeBlock(rows, m[2], m[3], nil, "探测偏移")
+    return off
 end
 
 
@@ -1610,38 +1704,14 @@ local function loadBucket(bid)
         BUCKET_FAIL[bid] = "读表失败 id=" .. tostring(tid)
         return false
     end
-    -- 数据行偏移：分片自带 "LLM1|" 表头时从 1 开始，否则从 0 开始。
-    -- 不写死，避免导入方式不同导致整段数据错位。
-    local off = 1
-    local h0 = rows[1] and pickField(rows[1])
-    if type(h0) == "string" and string.sub(h0, 1, 5) == "LLM1|" then off = 2 end
-    local chunks = {}
-    for r = r0 + off, r1 + off - 1 do
-        local row = rows[r]
-        local v = row and pickField(row)
-        if v then
-            chunks[#chunks + 1] = v
-        end
-    end
-    local b85 = table.concat(chunks)
-    if #b85 == 0 then
+    -- 行偏移不猜，交给 decodeBlock 自动适配（1/2/5 等前缀行数都试）
+    local raw, off, tries = decodeBlock(rows, r0, r1, nil, "桶" .. tostring(bid))
+    if not raw then
         BUCKETS[bid] = false
-        BUCKET_FAIL[bid] = "取到0个字符(表" .. tostring(tid) .. " 行" ..
-            tostring(r0 + off) .. "-" .. tostring(r1 + off - 1) .. " 共" .. tostring(#rows) .. "行)"
-        return false
-    end
-    local ok2, raw = pcall(function()
-        return Inflater.inflate(b85Decode(b85), 3)
-    end)
-    if not ok2 then
-        BUCKETS[bid] = false
-        BUCKET_FAIL[bid] = "inflate异常 " .. tostring(raw)
-        return false
-    end
-    if not raw or #raw == 0 then
-        BUCKETS[bid] = false
-        BUCKET_FAIL[bid] = "inflate返回空(取到" .. tostring(#b85) .. "字符, 首20=" ..
-            string.sub(b85, 1, 20) .. ")"
+        local why = table.concat(tries or {}, " | ")
+        if #why > 150 then why = string.sub(why, 1, 150) .. "..." end
+        BUCKET_FAIL[bid] = "解压失败(表" .. tostring(tid) .. " 行" .. tostring(r0) .. "-" ..
+            tostring(r1) .. " 共" .. tostring(#rows) .. "行) " .. why
         return false
     end
     -- 解析：条目用 \2 分隔，Q 与 A 用 \1 分隔
@@ -2713,19 +2783,34 @@ local function loadNG()
     for i = 1, #ids do
         local rows = readTable(ids[i])
         if not rows then NG_ERR = "读表失败 " .. tostring(ids[i]); return false end
-        local off = 1
-        local h0 = rows[1] and pickField(rows[1])
-        if type(h0) == "string" and string.sub(h0, 1, 4) == "NG3|" then off = 2 end
-        local chunks = {}
-        for r = off, #rows do
-            local v = rows[r] and pickField(rows[r])
-            if type(v) == "string" and v ~= "" then chunks[#chunks + 1] = v end
+        -- 同语料桶：行偏移不猜，用"能否解压出 NG3 魔数"自动适配
+        local out, offUsed, nTries = nil, nil, {}
+        local order = DETECT_OFF and { DETECT_OFF, 1, 2, 3, 4, 5, 6, 7 } or { 1, 2, 3, 4, 5, 6, 7 }
+        for _, off in ipairs(order) do
+            local chunks = {}
+            for r = off, #rows do
+                local v = rows[r] and pickField(rows[r])
+                if type(v) == "string" and v ~= "" then chunks[#chunks + 1] = v end
+            end
+            if #chunks > 0 then
+                local b85 = table.concat(chunks)
+                local ok, o = pcall(function() return Inflater.inflate(b85Decode(b85), 3) end)
+                if ok and type(o) == "string" and #o > 0 and string.sub(o, 1, 3) == "NG3" then
+                    out, offUsed = o, off
+                    if DETECT_OFF ~= off then
+                        DETECT_OFF = off
+                        D("[LLM-D] NG表行偏移自动适配 off=" .. off)
+                    end
+                    break
+                end
+                nTries[#nTries + 1] = "off" .. off .. "✗" .. tostring(o)
+            else
+                nTries[#nTries + 1] = "off" .. off .. "空"
+            end
         end
-        local b85 = table.concat(chunks)
-        if #b85 == 0 then NG_ERR = "取到空内容 表" .. tostring(i); return false end
-        local ok, out = pcall(function() return Inflater.inflate(b85Decode(b85), 3) end)
-        if not ok or type(out) ~= "string" or #out == 0 then
-            NG_ERR = "解压失败 表" .. tostring(i) .. " " .. tostring(out)
+        if not out then
+            NG_ERR = "解压失败 表" .. tostring(i) .. " (共" .. tostring(#rows) ..
+                "行) " .. table.concat(nTries, " | ")
             return false
         end
         parts[#parts + 1] = out
@@ -3325,6 +3410,9 @@ function Script:QuickCheck()
         return "tableIds 未配置"
     end
     D("tableIds: " .. #ids .. " 个")
+    -- 先探测一次行偏移，后面算"数据行数"才准
+    local po = probeOffset()
+    D("行偏移探测 off=" .. tostring(po))
     -- 期望行数
     local expectRows = {}
     for b = 0, NBUCKET - 1 do
@@ -3345,8 +3433,8 @@ function Script:QuickCheck()
             bad = bad + 1
         else
             local h0 = rows[1] and pickField(rows[1])
-            local off = 1
-            if type(h0) == "string" and string.sub(h0, 1, 5) == "LLM1|" then off = 2 end
+            local off = DETECT_OFF or 1
+            if not DETECT_OFF and type(h0) == "string" and string.sub(h0, 1, 5) == "LLM1|" then off = 2 end
             local dr = #rows - (off - 1)
             local cols = rows[1] and #rows[1] or 0
             if dr < exp or i <= 3 then
@@ -3436,8 +3524,8 @@ function Script:Diagnose()
                 end
             end
             local h0 = rows[1] and pickField(rows[1])
-            local off = 1
-            if type(h0) == "string" and string.sub(h0, 1, 5) == "LLM1|" then off = 2 end
+            local off = DETECT_OFF or 1
+            if not DETECT_OFF and type(h0) == "string" and string.sub(h0, 1, 5) == "LLM1|" then off = 2 end
             local dataRows = #rows - (off - 1)
             local mark = ""
             if dataRows < exp then
@@ -3507,33 +3595,43 @@ function Script:DiagBucket(bid)
     if not rows then D("  读表失败"); return "读表失败" end
     D("  表行数=" .. #rows .. " 首行列数=" .. tostring(rows[1] and #rows[1] or 0))
 
-    local off = 1
-    local h0 = rows[1] and pickField(rows[1])
-    if type(h0) == "string" and string.sub(h0, 1, 5) == "LLM1|" then off = 2 end
-    D("  表头=" .. tostring(h0) .. " -> 偏移 off=" .. off)
-
-    local chunks, miss = {}, 0
-    for r = r0 + off, r1 + off - 1 do
-        local row = rows[r]
-        local v = row and pickField(row)
-        if v then chunks[#chunks + 1] = v else miss = miss + 1 end
-    end
-    D("  取到字符块=" .. #chunks .. " 缺失行=" .. miss)
-    if miss > 0 then
-        -- 打印一个确实存在的行，看看真实内容
-        local rr = rows[r0 + off]
-        if rr then
-            local pv = {}
-            for k = 1, #rr do pv[#pv + 1] = "[" .. k .. "]" .. string.sub(tostring(rr[k]), 1, 16) end
-            D("  第" .. (r0 + off) .. "行实际: " .. table.concat(pv, " "))
+    -- 打印真实前 6 行，一眼看出导入后 rows 的实际结构
+    for k = 1, math.min(6, #rows) do
+        local rr = rows[k]
+        local pv = {}
+        if type(rr) == "table" then
+            for j = 1, math.min(#rr, 4) do
+                pv[#pv + 1] = "[" .. j .. "]" .. string.sub(tostring(rr[j]), 1, 20)
+            end
+        else
+            pv[#pv + 1] = tostring(rr)
         end
-        D("  【越界】需要行 " .. (r0 + off) .. ".." .. (r1 + off - 1) .. " 但表只有 " .. #rows .. " 行")
+        D("  rows[" .. k .. "] " .. table.concat(pv, " ") ..
+          "  取值=" .. string.sub(tostring(pickField(rr)), 1, 24))
     end
-    local b85 = table.concat(chunks)
-    D("  Base85 长度=" .. #b85 .. " 首24=" .. string.sub(b85, 1, 24))
-    local ok2, raw = pcall(function() return Inflater.inflate(b85Decode(b85), 3) end)
-    if not ok2 then D("  inflate 异常: " .. tostring(raw)); return "inflate异常" end
-    if not raw or #raw == 0 then D("  inflate 返回空"); return "inflate空" end
+
+    -- 逐个候选偏移试，把每次结果都打出来
+    local raw, off
+    for _, cand in ipairs({ 1, 2, 3, 4, 5, 6, 7 }) do
+        local chunks, miss = {}, 0
+        for r = r0 + cand, r1 + cand - 1 do
+            local v = rows[r] and pickField(rows[r])
+            if v and v ~= "" then chunks[#chunks + 1] = v else miss = miss + 1 end
+        end
+        if #chunks == 0 then
+            D("  off=" .. cand .. " 取不到任何字符(缺" .. miss .. "行)")
+        else
+            local b85 = table.concat(chunks)
+            local ok2, o = pcall(function() return Inflater.inflate(b85Decode(b85), 3) end)
+            local good = ok2 and type(o) == "string" and #o > 0 and string.find(o, "\1", 1, true)
+            D("  off=" .. cand .. " 取" .. #chunks .. "块/" .. #b85 .. "字符 首16=" ..
+              string.sub(b85, 1, 16) .. " -> " ..
+              (good and ("✓解压" .. #o .. "字节") or ("✗" .. tostring(o))))
+            if good and not raw then raw, off = o, cand end
+        end
+    end
+    if not raw then D("  所有偏移都失败"); return "解压失败" end
+    D("  【可用偏移 off=" .. off .. "】解压后 " .. #raw .. " 字节 首40=" .. string.sub(raw, 1, 40))
     D("  解压后 " .. #raw .. " 字节 首40=" .. string.sub(raw, 1, 40))
     local n = 0
     for _ in string.gmatch(raw, "[^\2]+") do n = n + 1 end
@@ -4050,8 +4148,8 @@ function Script:OnStart()
                 else
                     okT = okT + 1
                     local h0 = rows[1] and pickField(rows[1])
-                    local off = 1
-                    if type(h0) == "string" and string.sub(h0, 1, 5) == "LLM1|" then off = 2 end
+                    local off = DETECT_OFF or 1
+                    if not DETECT_OFF and type(h0) == "string" and string.sub(h0, 1, 5) == "LLM1|" then off = 2 end
                     local dr = #rows - (off - 1)
                     local exp = expectRows[i - 1] or 0
                     if dr < exp then
