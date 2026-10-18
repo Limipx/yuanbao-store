@@ -952,3 +952,37 @@ os          date / time / timeMs（无 clock，用了必崩）
 - 正解：乘法拆高低 16 位（中间量 < 2^41）；FNV-1a 应是**先异或后乘**（旧码是先乘后加，两者都不是）。
 - **测试陷阱**：lupa 是 Lua 5.5，有 int64 整数子类型，旧错法跑不出问题；
   要用 `2166136261.0` 强制 double 才能复现 5.1 行为。
+
+## 2026-10-18 · KVFS 房间/个人版 v2.1（9 条修复，86 项断言全过）
+
+- 交付：`KV文件系统_房间个人版v2.1.lua/.txt`（2867 行 / 113043 字节，md5 `f9405852`）
+  说明：`KV文件系统_房间个人版v2.1_修复说明.md`
+- **缓存必须带 TTL**：v2.0 两级缓存（KV 层 `s.cache` + 节点层 `o.cache`）永不过期 →
+  多人共享看不到彼此改动。v2.1 加 `cacheMs`（默认 1500ms，0=不缓存），
+  `DropCache` 改为**两级一起清**（v2.0 只清 KV 层）。
+- **resolve 未命中要丢缓存重试一次**：只加 TTL 还不够——B 缓存过 root 后，A 新建目录
+  B 在 TTL 内会解析失败（实测报"父目录不存在"）。修法：`if not nid then self:drop(); retry`。
+  只在真找不到时才付出代价。**这是"新建立即可见"的关键，别只做 TTL。**
+- **`FSGET(vid,0)` 与 `FSGET(vid,nil)` 是两份实例两套缓存**（keyOf 字符串不同）
+  → 同一个空间两份副本互不可见。必须 `PIDOF()` 把 0/""/nil 归一为 nil。
+  这是 `Hash`/`SimFind` 在个人空间恒 -404 的**更深层根因**（表层是 `N()` 写死 nil）。
+- **哈夫曼单叶节点必崩**：内容 ≥ COMP_MIN(384) 且只含 1 种字节时，树退化成单叶，
+  旧码仍走 `node.l/node.r` → nil → 索引 `node.b` 崩溃。修：`if t.b then` 直接按 bl 输出。
+  另加 `if not node then break end` 防损坏数据崩溃。
+- **ID 不能只靠 random**：双开客户端同秒同 seed → 序列完全相同 → 静默覆盖。
+  修：混入每实例 salt + **生成后查一次 `kNode(id)` 是否已占用，占用就换**（最多 8 次）。
+- **属性字段名是 `minValue`/`maxValue`**，写成 `min`/`max` 不报错但范围限制不生效。
+- **返回 JSON 串的开放函数 `returnType` 必须是 `Mini.String`**（v2.0 有 14 个错写 Number）。
+- `SetScope` v2.0 是空操作（赋值后无人读取）；v2.1 实现为「玩家留空时的默认玩家」，
+  格式 `room` / `personal:<uin>`。
+
+### 测试台方法（可复用，重要）
+- **用 lupa 的 `lua51`（Lua 5.1），不要用默认 lupa（5.5）**；5.5 有 int64 子类型，掩盖精度问题。
+- **单个 Lua 状态里把脚本源码执行 N 次**，每次得到独立 Script 表 = N 个"客户端"
+  （各自独立的 POOL/LC/CACHE_MS 等模块级 local）。比开 N 个 Lua 状态更好：KV 存储可放 Lua 侧。
+- **KV 存储必须放在 Lua 侧的 table 里**。若走 Python 函数传参，含非 UTF-8 字节的
+  Lua 字符串会在 `py_from_lua` 处抛 UnicodeDecodeError（压缩后的内容必触发）。
+- **Python 函数塞进 Lua 表后 `type()` 是 `userdata` 不是 `function`**，
+  会让 `type(bit.ror)=="function"` 这类自检假失败。要把它们包成 Lua 闭包再放进 bit 表。
+- **二进制（Pack 结果）不能经 Python 往返**，Pack→Unpack 必须在 Lua 内一次完成
+  （用 `raw()` 执行整段 Lua 代码）。
