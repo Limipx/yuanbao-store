@@ -766,3 +766,25 @@ MAX 2000 行
   | 1 全部（含枚举值） | 10678 | 6 | 1780 |
   三档均 **1 张表装下**，校验读回逐条一致 0 不一致
 - 强制 pack=1 时正确报 ERR 并提示所需 pack，不静默截断
+
+## ⛔ 一层 API 全量知识库（2026-10-18 建立）
+
+- 真机探针导出的一层反射结果：3112 条 / 275 模块 / 749 个函数 / 244 个纯枚举模块。
+- 知识库文件：`knowledge/miniworld-ugc/一层API全量知识库.md`（约 101KB，749 行函数表 + 枚举附录）。
+- 来源分三类，表格「来源」列明确标注：**官方 Wiki 505 / 标准库+真机 84 / 推测 160**。
+- **推测项（160 条）未经真机验证**，调用前必须 `type(模块.函数)` 判存在——不要当成可用 API 直接写进业务代码。
+- 官方 Wiki 抓取口径：`https://dev-wiki.mini1.cn/ugc-wiki/apis/<模块小写>.html`。
+  官方命名与反射名不总一致：`Timer`→官方页 `MiniTimer`，`Listen`→`ListenParam`，`Trigger` 无同名函数页。
+  `threadpool` / `json` / `LuaPanda` / `OfficeUtils` 官方无页面。
+- 官方页面对 Player/World 这类大模块只展开前几项，一次抓取拿不全；
+  解决办法是**用「只输出签名行」的窄提示 + 指定函数名清单分批抓**，比整页抓取覆盖高得多。
+- 引擎全局表用冒号调用：`Actor:GetPosition(objid)`；事件用
+  `ScriptSupportEvent:registerEvent([=[事件名]=], 处理函数)`。
+- 50ms = 1 tick；时间调度一律 `os.timeMs()`。
+
+### 已知易错点（本次核对确认）
+- 官方 `Block:SetBlockSwichState`、`Block:BluePrintSetUploadInteral` 是官方自己的拼写（Swich / Interal），不是笔误，照抄。
+- `Backpack:GetGridItemID` 返回 `{itemid, num}` 表，不是单值。
+- `CloudSever` 官方只有 3 个接口：`SetDataListBykey` / `GetDataListByKey`（带 callback）/ `GetRoomID`。
+  真机反射里另有 `SetDataListValue`、`TransmitToCategoryRoom` 等，官方未文档化。
+- `Data` 真机反射含 `Array` / `Map` / `Table` 三个子表 + 4 个函数；云服旧模块 `CloudSever` 已作废，走 `Data.Map`。
