@@ -596,3 +596,69 @@ mock 必须全程保持 32 位无符号，仅出口 `tobit` 转有符号。
 真机导入后**先跑 Env()**，一次打印：bit 成员清单（有/缺）、ror 路径
 （原生/自拼）、os.timeMs 存在性、SHA256(abc) 是否正确。
 `SHA256(abc)=错` 说明 bit 语义非 32 位，整个哈希层不可信，立刻停用。
+
+---
+
+## ⛔ 二维表导出铁律（用户反复强调，2026-10-18 立）
+
+**导出没有内存限制 → 一律导出原版，不压缩、不编码、不截断。**
+
+- 之前 RSA / MiniMind 用 base85 + deflate 是**特例**（MB 级数据要塞进二维表）。
+  **API 清单、配置表、日志这类小数据必须原文直出**，我再压缩就是错的。
+- 二维表 CSV 格式（真机验证过的那种）：
+  ```
+  字段备注,xxx,
+  字段名,xxx,
+  字段类型,string,
+  1,"值",
+  2,"值",
+  ```
+  3 列：行号 / 引号包裹的值 / 空。前 3 行元数据。多字段用 `|` 拼在值里。
+- 每表行数按需分片（默认 1800），**表不够要明确报"还差几张"**，不要静默截断。
+
+## 引擎环境硬事实（2026-10-18 真机探针 + 用户早期探测文档）
+
+**确认：Lua 5.1（修改优化版），不是 LuaJIT** —— `jit=nil` `ffi=nil`。
+（此前我据截图里 fill/copy/gc/load/string/arch/os 七个字段断定是 LuaJIT，**错了**，
+那七个与 LuaJIT 的 ffi 成员同名，但实机 ffi 是 nil。据它规划的 ffi 加速全部作废。）
+
+- `bit` 12 成员**含 ror**（我一度记成"只有 rol"，已证伪）
+- `os.timeMs` 存在、`os.clock` 不存在（用了必崩）
+- `io` 空表、`package` 空表、`debug` 仅 traceback
+- 大数：2^53 与 2^53+1 **完全相同** → double，BN 是刚需
+- `bit.lshift(1,31) = -2147483648` → 有符号 32 位，取高位要 +4294967296
+
+**⚠️ 两版探测结果有差异，待真机确证（别只信一版）**
+
+| 库 | 用户早期文档版 | 我 10-18 探针版 |
+|---|---|---|
+| string | startswith/endswith/split/**dump** | Trim/split（无 startswith/endswith） |
+| table | 15 个（clone/equal/merge/move/show/num_pairs/foreach/foreachi/maxn/tostring/getn） | 8 个（无 move/merge/show/num_pairs） |
+| math | 34 个，含 pow/tanh/mod/clamp/lerp/ldexp | 34 个（一致） |
+
+**规则：涉及"引擎某 API 存不存在"必须回查转储或真机探针，禁止凭记忆下结论，
+禁止在注释里写"（实测）"三个字——我写过的两处"实测"恰好都是记反的。**
+
+## 转储与全模块探针（2026-10-18）
+
+- `apitool/dump_parsed.json`：7267 顶层键，**284 个 table 模块**，一层成员 **3840**
+  - TriggerEvent 252 / ObjectEvent 182 / Player 309 / Monster 162 / Actor 136 / World 125
+  - 类型分布 value 2045 / function 1606 / table 189
+- 交付物：`API全模块探针.lua`（9 个开放函数：扫描/事件/导出二维表/分块打印/CSV/单模块/查/对照/自检）
+  + `API转储基线_二维表.csv`（3840 行，转储版对照底表）
+- **铁律：以运行时二维表结果为准**，转储清单只用来提示"哪个模块不见了"
+
+## 沙盒工具笔记（我自己踩的）
+
+- `lupa 2.8` 后端是 **Lua 5.5**，不是 5.1：
+  - `math.ceil(x)` 返回 nil → 脚本里改用纯加法算分片
+  - `table.concat` 不是函数 → 自实现 `_join`
+  - Python 函数塞进 Lua 表后**不能用冒号调用** → 用 Lua 闭包包一层
+  - `os.timeMs` 需 mock；Python lambda 的 type 是 userdata（自检会误判"不存在"）
+- mock 引擎环境时**不要覆盖 string/table/os 等标准库名**，否则自检全误报
+
+## 交付纪律（血泪）
+
+- 说"做好了/已生成"必须**同轮带文件**——已违规 4 次：v3.3、反作弊 zip、RSA v2、真随机 v3
+- 更严重的一次：反作弊 zip **文件根本不存在**却说"已打包"（属编造，非疏漏）
+- 对策：**先交付再写说明**；交付前核 md5
