@@ -734,3 +734,35 @@ MAX 2000 行
 ```
 **转储写的是变参 `self,varId,playerId,...`，照它猜多传参数 → 行号被塞进第1列、数据挤到第2列，不报错静默错位。**
 规则：API 签名一律以实机跑通的脚本为准，转储只用来查"有没有这个成员"。
+
+
+## 引擎 API 转储结构（apitool/dump_parsed.json）— 2025-10-18 实测
+- **结构**：扁平字典，`key="A.B.C"` 路径，`value=[type, args]`（type ∈ table/function/value）
+- **规模**：总条目 7267；顶层 table 模块 **285**；一层成员 3840（function 1606）；
+  二层子表 **189**（如 Data.Map / Data.Table / Data.Array / BlockEdit.* 枚举表）；
+  二层成员 3072（function 457）
+- ⛔ **转储把标准库也当模块**：顶层含 `_G / string / math / table / os / io / coroutine /
+  package / debug / pairs / ipairs / print / assert / next / select / bit / _VERSION` 等。
+  若把它们全当"模块"扫描，会误报大量"缺失"（实测 71 个噪音 → 只取 `type=='table'` 的顶层后降到 1）
+- **正解**：模块列表 = 顶层且 `type=='table'` 的 key（285 个），不是全部顶层 key（355 个）
+
+## Lua 测试环境硬事实（修正此前错误说法）
+- ⛔ **lupa 当前是 Lua 5.5，不是 5.1**。此前多轮声称"lupa 真 Lua 5.1 与引擎同版本"是**错的**。
+  5.5 有 `os.clock`、`math.tanh`；引擎 5.1 没有。测试结论中涉及这两者的必须标注环境。
+- **造 mock 引擎的坑**：按转储生成 mock 时若直接 `pairs = function() end`、`print = function() end`、
+  `type = function() end`，会**把解释器自身库覆盖掉**，后续 print/pairs 全废且报错无对象。
+  必须跳过保留名（_G/_ENV/string/math/table/os/io/coroutine/package/type/print/pairs/
+  ipairs/select/require/tostring/tonumber/next/error/pcall/unpack/debug/bit/jit/ffi/arg）。
+- 保留名里 **Data 不能跳过**（它是引擎模块，需 `Data = {}` 先建，再 Data.Map/Data.Table）
+
+## 探针 v4（含二层）实测结论
+- 扫描 `_G` 时**必须跳过自引用容器** `_G / package / _ENV / arg`，否则产生
+  `_G.Data.Map` 这类无意义重复路径
+- 导出规模（mock 引擎，scope 三档）：
+  | scope | 记录数 | 自动pack | 行数 |
+  |---|---|---|---|
+  | 0 表+函数（默认） | 5379 | 3 | 1793 |
+  | 2 仅函数 | 4247 | 3 | 1416 |
+  | 1 全部（含枚举值） | 10678 | 6 | 1780 |
+  三档均 **1 张表装下**，校验读回逐条一致 0 不一致
+- 强制 pack=1 时正确报 ERR 并提示所需 pack，不静默截断

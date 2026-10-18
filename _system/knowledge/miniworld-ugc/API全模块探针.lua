@@ -1,19 +1,76 @@
 --[[
-API 全模块反射探针 v4  —— 递归到二层(Data.Map / Data.Table 等)
+API 全模块反射探针 v4  ——  递归到二层 (Data.Map / Data.Table / BlockEdit.* ...)
 ====================================================================
-铁律：
-  * 以【运行时二维表实测结果】为准，转储只用于查"有没有这个成员"
-  * 导出：只有 2000 行限制，【没有内存限制】-> 只用 1 张表，一行放多条(pack)
+导出内容两条线：
+  L1  模块:函数          Game.ShowMsgBox
+  L2  模块.成员:函数      Data.Map.GetMapValue / Data.Table:InsertValue
+另记录 L0=模块本体、LS=二层子表本体(Data.Map / Data.Table)
+
+铁律(来自实机, 别再犯):
+  * 以【运行时二维表实测结果】为准, 转储只用于查"有没有这个成员"
+  * 导出：只有 2000 行限制, 【没有内存限制】 -> 只用 1 张表, 一行放多条(pack)
   * 导入：500KB 内存 + 2000 行
   * Data.Table 实机签名(来自建筑文件生成器3.1)：
         Data.Table:Clear(tableId, nil)
         Data.Table:InsertValue(tableId, nil, 一个字符串)      <- 只传【一个】
         Data.Table:GetAllValue(tableId, nil) -> allRows[i][1]  <- 第1行是头部
-    传多个参数会把行号塞进第1列，不报错、静默错位
+    多传参数会把行号塞进第1列, 不报错、静默错位
+  * 每行拼接常量【行尾必须有 ..】否则两段并成一个, gmatch 少拆(静默丢数据)
 ====================================================================
+记录格式:  路径|类型|层级|来源
+  层级  L0=模块  L1=一层成员  L2=二层成员  LS=二层子表本体
+  来源  D=转储里有  R=运行时新增(转储没记)
 ]]
 
 local Script = {}
+
+local DUMP_MODS =
+    "ABSOLUTECAMPTYPE Ability AbsoluteCampType Action ActionType Actor ActorBodyEffect Aggro AliveState AnimMode Area AreaCloneType AreaFillType AreaSimilarity AutoSprinklerBlock " ..
+    "AvtPart BACKPACK_TYPE Backpack BackpackBeginIndex BackpackComponent BackpackType BeaconClampType BeaconMapType BeginType Biome BiomeType Block BlockAttr BlockEdit BlockId " ..
+    "BlockLimits BlockStateEdit BlockStateType BlockStatus Blueprint Bool BoxRefresh BtreeRangeType Buff CREATUREATTR CameraEditState CameraModel CameraRotate Chat CheckList Chest " ..
+    "ClientPositive CloudSever CmpProPermission CmpUIPermission Collider Color ColorGrandient CommonBlockPlace ComponentType ComponentUIPermissions ComponentUIStyle CraftingEdit " ..
+    "CreatureAttr CreatureMotion Cropblock CustomData CustomModType CustomMsg CustomUI Data DeviceType DoExplodeStatus DoHarmStatus Door DropItem DropMode Easing Effect ElementAttr " ..
+    "ElementType Entity EntityType Enum EquipEdit EquipSlotType ErrorCode EventDate ExplodeDmgType FaceDir FaceType Feed Fight FoodEdit FurnaceEdit FurnaceType GRAPHICS GSoundType Game " ..
+    "GameActorType GameEffect GameObject GameRule GameSetting GamemakerRule GenerateBlock GoBackType Graphics GraphicsType GridAttr GroupView GroupWeatherType Grow GunAction " ..
+    "GunActionBan GunAttr GunDamageType GunEdit GunFireType GunSpreadType GunState HURTTYPE HorizontalOffset HumanBodyAnchorId HurtType ITEMATTR InnerPopUpview Item ItemAbility ItemAttr " ..
+    "ItemEdit ItemEffectType KeyCode LaunchProjectileStatus LayingEggType LightingFurniture LineAnimation LinearTransformation Listen Log LogLevel LuaPanda MODATTRIB_TYPE MapMarkType " ..
+    "MapShopOrder MatchMode Material Mini MiniCurrency MiniMapMarkType MiniShopData MiniShopDetail MiniShopPage MiniShopWarehouse MiniViewSecondTab Mob MobType Mod ModAttribType Model " ..
+    "ModelAction Monster MonsterEdit MoveType NPCShop Number ObjType Object ObjectEvent ObjectLib ObsBluePrintStatus OfficeUtils OldGunEdit PLAYERATTR PackEdit PathPoint Physics " ..
+    "PickupActionType Picture PixelUnits Player PlayerAttr PlayerBodyUIHight PlayerController PlayerMotion PlayerNameType PlayerRelations PlayerType Prefab ProgressImg ProgressVal " ..
+    "Projectile ProjectileEdit RandomAddStatus RayDetectType RecoverStatus RelativeCampType RelativeType Reproduction Ride Roadblock Role RoleAttr RoleMotion RolePickupType Rotation " ..
+    "Scale SkeletonPoint SkyBox SkyBoxFilter SkyboxAttr SkyboxAttrNoTime SkyboxColor SkyboxFilter SkyboxFilterSwitch SkyboxMap SkyboxParticle SkyboxSwitch SkyboxTime SortType Sound " ..
+    "Status StatusEdit StorageType String SurviveComponent Tag Tame Task TaskAnimType TaskChainType TaskDialogType TaskEvent TaskPassType TaskType TaskUIType Team TeamAttr TeamResults " ..
+    "TerrainType ThrowItem Timer ToolEdit TouchState Trigger TriggerEvent TurnFaceDir UIAttr UIProjectSet UIScollDir UiElement UiState UseEdit VDistanceRange VIEWPORTTYPE VarType Vec2 " ..
+    "Vec3 VerticalOffset ViedoPlayMode ViewPortType Villager WeatherGroup WeatherType WorkStage WorkeStage World WorldContainer WorldRuleBaseSetting WorldRuleCloudSetting " ..
+    "WorldRuleFightSetting WorldRuleHUDUI WorldRuleRebirth WorldRuleSceneUI WorldRuleSound WorldRuleStartMode WorldType _G __info bit coroutine debug io json math os package string " ..
+    "table threadpool "
+
+local DUMP_SUBS =
+    "Aggro.CampRelation Aggro.SearchRangeType AutoSprinklerBlock.State BackpackComponent.InteractMode BlockEdit.BlockFlowType BlockEdit.BuiltInType BlockEdit.ColliderBoxType " ..
+    "BlockEdit.ColliderModeSelect BlockEdit.ColliderShape BlockEdit.ColliderState BlockEdit.ColliderType BlockEdit.CoverNeighborType BlockEdit.DrawType BlockEdit.GravityEffectType " ..
+    "BlockEdit.InteractSwitch BlockEdit.InteractType BlockEdit.LodType BlockEdit.MineToolType BlockEdit.PhyCollideType BlockEdit.PlaceDirType BlockEdit.PushFlagType BlockEdit.ToolLevel " ..
+    "BlockStateEdit.CustomColliderState BlockStateEdit.SubMeshDataType BoxRefresh.RefreshNumType BoxRefresh.RefreshType Chest.MaxGridCountType Collider.ColliderType " ..
+    "Collider.NoPhyscColliderShap Collider.PhysicColliderShape CommonBlockPlace.PlaceTypeGroup CraftingEdit.RequirementToolsEnum CraftingEdit.SubTypeEnum CraftingEdit.TypeEnum " ..
+    "Cropblock.AbundantType Cropblock.CropState Cropblock.CropType Cropblock.HarvestType Cropblock.WetAffectType Data.Array Data.Map Data.Table DoExplodeStatus.DestroyBlock " ..
+    "DoExplodeStatus.ExplodeRangeType DoExplodeStatus.HarmType DoHarmStatus.AttackType DoHarmStatus.HarmInherit DoHarmStatus.HarmType Door.ControlModeType EquipEdit.AnchorType " ..
+    "EquipEdit.PartModelType EquipEdit.slotType Feed.BubbleType Feed.FeedReactType Feed.RewardItemType Fight.AnimationName Fight.AttackMode Fight.ColliderShape Fight.NoPhyscColliderShap " ..
+    "Fight.Team FoodEdit.BarbecueType FoodEdit.FoodTIngredientsType FoodEdit.Time FurnaceEdit.FurnaceType GenerateBlock.GenerateNumType GenerateBlock.RandomType Grow.BubbleType " ..
+    "GunEdit.AutoFireType GunEdit.DamageType GunEdit.FireType GunEdit.GunHandSlot GunEdit.GunType GunEdit.PointLooksType GunEdit.ReloadType GunEdit.SightLooksType GunEdit.SightMode " ..
+    "GunEdit.SightType GunEdit.SpreadSet GunEdit.SpreadType GunEdit.TrajectoryType GunEdit.TweenFuncName ItemEdit.DropItemEnum ItemEdit.ProductType ItemEdit.QualityLevel " ..
+    "ItemEdit.UseType LaunchProjectileStatus.LaunchDir LaunchProjectileStatus.LaunchDirType LaunchProjectileStatus.LaunchType LayingEggType.__info LightingFurniture.ControlMode " ..
+    "Mini.Array Mini.EventType Model.AvatarAnchorType Model.GunAnchorType Model.PartType MonsterEdit.Type NPCShop.CostType NPCShop.DialogScene NPCShop.GoodsQuality NPCShop.PayType " ..
+    "NPCShop.RefreshType NPCShop.ShopType NPCShop.TagMatchMode OldGunEdit.BulletType OldGunEdit.FireType OldGunEdit.GunType PackEdit.PackType Physics.ColliderShape Physics.LayerType " ..
+    "Physics.PhysicsType PlayerController.CrosshairType PlayerController.Mode PlayerController.MoveLimit PlayerController.RoteLimit PlayerController.ViewMove PlayerController.ViewType " ..
+    "PlayerController.ZoomMode Projectile.HitProcess Projectile.HitType Projectile.HurtType Projectile.TrailType ProjectileEdit.AccumulatorType ProjectileEdit.AttackType " ..
+    "ProjectileEdit.DamageType ProjectileEdit.PhysicsMaterialType ProjectileEdit.TriggerCondition RandomAddStatus.triggerTimeEnumType RecoverStatus.AttrType RecoverStatus.ModifyType " ..
+    "Reproduction.ReproductionType Ride.RideMobType Ride.RidingConditionType Ride.RidingHpType Ride.RidingItemPermissionType Roadblock.ColliderType Sound.playModeType Sound.startType " ..
+    "StatusEdit.priority StatusEdit.triggerTimeEnumType StatusEdit.type SurviveComponent.AddAttrType Tame.TameMobType Tame.TameType ToolEdit.ToolType Trigger.Actor Trigger.Area " ..
+    "Trigger.ArrayTmp Trigger.Backpack Trigger.Block Trigger.Buff Trigger.Component Trigger.CustomUI Trigger.GameObject Trigger.Graphics Trigger.Item Trigger.KvMap Trigger.Math " ..
+    "Trigger.Monster Trigger.Player Trigger.World UIProjectSet.bgColorEnum UIProjectSet.systemLevelEnum UseEdit.ChargeType UseEdit.CostType UseEdit.RangeType UseEdit.SkillType " ..
+    "UseEdit.TargetTeam Villager.AvatarAnchorType Villager.GunAnchorType Villager.PartType Villager.ProfessionType WorldRuleBaseSetting.WeatherType WorldRuleCloudSetting.GameModeType " ..
+    "WorldRuleFightSetting.attackModeType WorldRuleFightSetting.defenseFormulaType WorldRuleHUDUI.MapIconClickType WorldRuleHUDUI.MapPlayerIconType WorldRuleHUDUI.MapPlayerShowType " ..
+    "WorldRuleRebirth.deathDropModeType WorldRuleRebirth.rebirthCostModeType WorldRuleRebirth.rebirthModeType WorldRuleSceneUI.displayNameType WorldRuleSound.backgroundMusicType " ..
+    "WorldRuleSound.ratioPec WorldRuleStartMode.displayNameType WorldRuleStartMode.levelModeTypeEnum WorldRuleStartMode.playerLimitTypeEnum __info.Oviparous __info.Viviparous "
 
 Script.propertys = {
     tableIdsText = {
@@ -27,22 +84,48 @@ Script.propertys = {
         displayName = "每行合并几条(0=自动)",
         defaultValue = 0,
         minValue = 0,
-        maxValue = 50,
-        tips = "一条=模块|路径|类型|层级; 多条用;拼成一行",
+        maxValue = 60,
+        tips = "0=自动算成刚好1张表装下; 多条用;拼成一行",
     },
     maxDepth = {
         type = Mini.Number,
         displayName = "递归深度(2=探到Data.Map这层)",
         defaultValue = 2,
         minValue = 1,
-        maxValue = 4,
+        maxValue = 3,
+        tips = "2足够: 覆盖 模块.成员:函数",
+    },
+    scanScope = {
+        type = Mini.Number,
+        displayName = "扫描范围(0=表+函数,1=全部,2=仅函数)",
+        defaultValue = 0,
+        minValue = 0,
+        maxValue = 2,
+        tips = "0=表与函数(默认); 1=连枚举常量一起导; 2=只导函数(最精简)",
+    },
+    memberCap = {
+        type = Mini.Number,
+        displayName = "每个表最多取多少成员",
+        defaultValue = 500,
+        minValue = 50,
+        maxValue = 2000,
+        tips = "防止超大表把扫描卡死",
     },
     blockBytes = {
         type = Mini.Number,
         displayName = "分块打印字节数",
-        defaultValue = 400,
+        defaultValue = 500,
         minValue = 50,
         maxValue = 4000,
+        tips = "结果只能靠print看, 无io",
+    },
+    printMax = {
+        type = Mini.Number,
+        displayName = "最多打印多少条",
+        defaultValue = 400,
+        minValue = 20,
+        maxValue = 5000,
+        tips = "防刷屏; 导出不受此限",
     },
 }
 
@@ -69,7 +152,7 @@ Script.openFnArgs = {
     },
     ShowModule = {
         returnType = Mini.String,
-        displayName = "⑤打印指定模块",
+        displayName = "⑤打印指定模块(含二层)",
         params = { "模块名", Mini.String },
     },
     FindMember = {
@@ -79,455 +162,492 @@ Script.openFnArgs = {
     },
     DumpEvents = {
         returnType = Mini.String,
-        displayName = "⑦打印TriggerEvent",
+        displayName = "⑦打印事件表",
         params = {},
     },
-    Summary = {
+    DiffDump = {
         returnType = Mini.String,
-        displayName = "⑧统计摘要",
+        displayName = "⑧与转储对照(缺/新增)",
         params = {},
     },
-    SelfTest = {
+    EnvInfo = {
         returnType = Mini.String,
-        displayName = "⑨运行自检",
+        displayName = "⑨环境自检",
         params = {},
     },
 }
 
 --------------------------------------------------------------------
--- 内置模块清单(来自转储 282 个顶层模块)
+-- 基础工具
 --------------------------------------------------------------------
-local MODS = {
-  "ABSOLUTECAMPTYPE", "Ability", "AbsoluteCampType", "Action", "ActionType", "Actor", "ActorBodyEffect",
-  "Aggro", "AliveState", "AnimMode", "Area", "AreaCloneType", "AreaFillType", "AreaSimilarity", "AutoSprinklerBlock",
-  "AvtPart", "BACKPACK_TYPE", "Backpack", "BackpackBeginIndex", "BackpackComponent", "BackpackType", "BeaconClampType",
-  "BeaconMapType", "BeginType", "Biome", "BiomeType", "Block", "BlockAttr", "BlockEdit", "BlockId", "BlockLimits",
-  "BlockStateEdit", "BlockStateType", "BlockStatus", "Blueprint", "Bool", "BoxRefresh", "BtreeRangeType",
-  "Buff", "CREATUREATTR", "CameraEditState", "CameraModel", "CameraRotate", "Chat", "CheckList", "Chest",
-  "ClientPositive", "CloudSever", "CmpProPermission", "CmpUIPermission", "Collider", "Color", "ColorGrandient",
-  "CommonBlockPlace", "ComponentType", "ComponentUIPermissions", "ComponentUIStyle", "CraftingEdit", "CreatureAttr",
-  "CreatureMotion", "Cropblock", "CustomData", "CustomModType", "CustomMsg", "CustomUI", "Data", "DeviceType",
-  "DoExplodeStatus", "DoHarmStatus", "Door", "DropItem", "DropMode", "Easing", "Effect", "ElementAttr",
-  "ElementType", "Entity", "EntityType", "Enum", "EquipEdit", "EquipSlotType", "ErrorCode", "EventDate",
-  "ExplodeDmgType", "FaceDir", "FaceType", "Feed", "Fight", "FoodEdit", "FurnaceEdit", "FurnaceType", "GRAPHICS",
-  "GSoundType", "Game", "GameActorType", "GameEffect", "GameObject", "GameRule", "GameSetting", "GamemakerRule",
-  "GenerateBlock", "GoBackType", "Graphics", "GraphicsType", "GridAttr", "GroupView", "GroupWeatherType",
-  "Grow", "GunAction", "GunActionBan", "GunAttr", "GunDamageType", "GunEdit", "GunFireType", "GunSpreadType",
-  "GunState", "HURTTYPE", "HorizontalOffset", "HumanBodyAnchorId", "HurtType", "ITEMATTR", "InnerPopUpview",
-  "Item", "ItemAbility", "ItemAttr", "ItemEdit", "ItemEffectType", "KeyCode", "LaunchProjectileStatus",
-  "LayingEggType", "LightingFurniture", "LineAnimation", "LinearTransformation", "Listen", "Log", "LogLevel",
-  "LuaPanda", "MODATTRIB_TYPE", "MapMarkType", "MapShopOrder", "MatchMode", "Material", "Mini", "MiniCurrency",
-  "MiniMapMarkType", "MiniShopData", "MiniShopDetail", "MiniShopPage", "MiniShopWarehouse", "MiniViewSecondTab",
-  "Mob", "MobType", "Mod", "ModAttribType", "Model", "ModelAction", "Monster", "MonsterEdit", "MoveType",
-  "NPCShop", "Number", "ObjType", "Object", "ObjectEvent", "ObjectLib", "ObsBluePrintStatus", "OfficeUtils",
-  "OldGunEdit", "PLAYERATTR", "PackEdit", "PathPoint", "Physics", "PickupActionType", "Picture", "PixelUnits",
-  "Player", "PlayerAttr", "PlayerBodyUIHight", "PlayerController", "PlayerMotion", "PlayerNameType", "PlayerRelations",
-  "PlayerType", "Prefab", "ProgressImg", "ProgressVal", "Projectile", "ProjectileEdit", "RandomAddStatus",
-  "RayDetectType", "RecoverStatus", "RelativeCampType", "RelativeType", "Reproduction", "Ride", "Roadblock",
-  "Role", "RoleAttr", "RoleMotion", "RolePickupType", "Rotation", "Scale", "SkeletonPoint", "SkyBox", "SkyBoxFilter",
-  "SkyboxAttr", "SkyboxAttrNoTime", "SkyboxColor", "SkyboxFilter", "SkyboxFilterSwitch", "SkyboxMap", "SkyboxParticle",
-  "SkyboxSwitch", "SkyboxTime", "SortType", "Sound", "Status", "StatusEdit", "StorageType", "String", "SurviveComponent",
-  "Tag", "Tame", "Task", "TaskAnimType", "TaskChainType", "TaskDialogType", "TaskEvent", "TaskPassType",
-  "TaskType", "TaskUIType", "Team", "TeamAttr", "TeamResults", "TerrainType", "ThrowItem", "Timer", "ToolEdit",
-  "TouchState", "Trigger", "TriggerEvent", "TurnFaceDir", "UIAttr", "UIProjectSet", "UIScollDir", "UiElement",
-  "UiState", "UseEdit", "VDistanceRange", "VIEWPORTTYPE", "VarType", "Vec2", "Vec3", "VerticalOffset",
-  "ViedoPlayMode", "ViewPortType", "Villager", "WeatherGroup", "WeatherType", "WorkStage", "WorkeStage",
-  "World", "WorldContainer", "WorldRuleBaseSetting", "WorldRuleCloudSetting", "WorldRuleFightSetting",
-  "WorldRuleHUDUI", "WorldRuleRebirth", "WorldRuleSceneUI", "WorldRuleSound", "WorldRuleStartMode", "WorldType",
-  "__info", "bit", "coroutine", "debug", "json", "math", "os", "string", "table", "threadpool",
-}
+local _recs = {}          -- 结果: 每条 "路径|类型|层级|来源"
+local _n = 0
+local _stat = {}
+local _setMods = {}       -- 转储模块名集合
+local _setSubs = {}       -- 转储二层子表路径集合
 
---------------------------------------------------------------------
--- 工具
---------------------------------------------------------------------
-local function _split(s, sep)
-    local r, n = {}, 0
-    if not s or s == "" then return r end
-    sep = sep or ","
-    local pat = "[^" .. sep .. "]+"
-    for w in string.gmatch(s, pat) do
-        n = n + 1
-        local v = string.gsub(w, "^%s+", "")
-        v = string.gsub(v, "%s+$", "")
-        r[n] = v
+local function _kind(v)
+    local t = type(v)
+    if t == "table" or t == "function" or t == "string" or t == "number"
+       or t == "boolean" or t == "userdata" or t == "thread" then
+        return t
     end
-    return r
+    return "other"
 end
 
-local function _trim(s)
-    if not s then return "" end
-    s = string.gsub(s, "^%s+", "")
-    s = string.gsub(s, "%s+$", "")
-    return s
-end
-
-local function _join(t, sep)
-    local r, n = {}, 0
-    for i = 1, #t do
-        n = n + 1
-        r[n] = tostring(t[i])
-    end
-    return table.concat(r, sep or ",")
-end
-
--- 不用 math.ceil(沙盒实测返回nil): 纯加法算块数
-local function _blocks(total, size)
-    if size <= 0 then size = 400 end
+local function _words(s)
     local n = 0
-    local acc = 0
-    while acc < total do
-        n = n + 1
-        acc = acc + size
-    end
-    if n == 0 then n = 1 end
+    for _ in string.gmatch(s, "%S+") do n = n + 1 end
     return n
 end
 
-local function _printBlocks(tag, lines)
-    local size = Script.blockBytes or 400
-    if size < 50 then size = 50 end
-    local all = _join(lines, "\n")
-    local nbk = _blocks(string.len(all), size)
-    local pos = 1
-    for b = 1, nbk do
-        local part = string.sub(all, pos, pos + size - 1)
-        pos = pos + size
-        print("[块" .. b .. "/" .. nbk .. "] " .. tag .. "\n" .. part)
-    end
-    return nbk
+local function _fill(set, s)
+    local n = 0
+    for w in string.gmatch(s, "%S+") do set[w] = true n = n + 1 end
+    return n
 end
 
---------------------------------------------------------------------
--- 记录与递归
---------------------------------------------------------------------
-local _recs = {}
-local _seen = {}
-local _stat = { modOK = 0, modMiss = 0, rec = 0, t1 = 0, t2 = 0, t3 = 0 }
-
-local function _add(path, ty, depth)
-    local n = #_recs + 1
-    _recs[n] = { path = path, ty = ty, d = depth }
-    _stat.rec = n
-    if depth == 1 then
-        _stat.t1 = _stat.t1 + 1
-    elseif depth == 2 then
-        _stat.t2 = _stat.t2 + 1
-    else
-        _stat.t3 = _stat.t3 + 1
-    end
+local function _keyname(k)
+    if type(k) == "string" then return k end
+    local ok, r = pcall(tostring, k)
+    if ok and type(r) == "string" then return r end
+    return "?"
 end
 
--- 递归遍历一张表; depth=1 表示这是模块的直接成员
-local function _walk(tbl, path, depth, maxd)
-    if type(tbl) ~= "table" then return end
-    if depth > maxd then return end
-    local key = "@" .. tostring(tbl)
-    if _seen[key] then return end
-    _seen[key] = 1
-
-    local cnt = 0
-    local okf, errf = pcall(function()
-        for k, v in pairs(tbl) do
+-- 安全取成员列表: 返回数组 {{k,v}...}
+local function _members(t, cap)
+    local out, cnt = {}, 0
+    local ok = pcall(function()
+        for k, v in pairs(t) do
             cnt = cnt + 1
-            local full = path .. "." .. tostring(k)
-            local ty = type(v)
-            if ty == "table" then
-                _add(full, "table", depth)
-                if depth < maxd then
-                    _walk(v, full, depth + 1, maxd)
+            if cnt > cap then break end
+            out[cnt] = { k, v }
+        end
+    end)
+    return out, ok, cnt
+end
+
+local function _push(path, kind, lv, src)
+    _n = _n + 1
+    _recs[_n] = path .. "|" .. kind .. "|" .. lv .. "|" .. src
+end
+
+local function _say(s)
+    print(s)
+end
+
+-- 分块打印
+local BLOCK = {}
+local function _emit(s)
+    BLOCK[#BLOCK + 1] = s
+end
+local function _flush(blockBytes)
+    local buf, total = "", 0
+    local idx = 0
+    for i = 1, #BLOCK do
+        local one = BLOCK[i] .. "\n"
+        if #buf + #one > blockBytes then
+            idx = idx + 1
+            print("[块" .. idx .. "] " .. buf)
+            total = total + #buf
+            buf = one
+        else
+            buf = buf .. one
+        end
+    end
+    if #buf > 0 then
+        idx = idx + 1
+        print("[块" .. idx .. "] " .. buf)
+        total = total + #buf
+    end
+    print("=== 共" .. idx .. "块 / " .. total .. "字节 ===")
+    BLOCK = {}
+    return idx, total
+end
+
+--------------------------------------------------------------------
+-- ① 扫描
+--------------------------------------------------------------------
+function Script:ScanAll()
+    _recs = {}
+    _n = 0
+    _stat = { modOk = 0, modMiss = 0, l0 = 0, l1 = 0, l2 = 0,
+              ls = 0, newMod = 0, newMem = 0, subMiss = 0 }
+
+    if not _setMods.__loaded then
+        _stat.dumpMods = _fill(_setMods, DUMP_MODS)
+        _stat.dumpSubs = _fill(_setSubs, DUMP_SUBS)
+        _setMods.__loaded = true
+    end
+
+    local depth  = self.maxDepth or 2
+    if depth < 1 then depth = 1 end
+    local scope  = self.scanScope or 0
+    local cap    = self.memberCap or 500
+    if cap < 50 then cap = 50 end
+
+    local function want(kind)
+        if scope == 1 then return true end
+        if scope == 2 then return kind == "function" end
+        return kind == "table" or kind == "function"
+    end
+
+    -- 收集模块名: 转储 ∪ 运行时 _G 里的 table
+    local names, seen = {}, {}
+    for w in string.gmatch(DUMP_MODS, "%S+") do
+        if not seen[w] then seen[w] = true names[#names + 1] = w end
+    end
+    local SKIP = { _G = true, package = true, _ENV = true, arg = true,
+                   Script = true, utf8 = true }
+    local okG = pcall(function()
+        for k, v in pairs(_G) do
+            if type(v) == "table" and not SKIP[_keyname(k)] then
+                local nm = _keyname(k)
+                if not seen[nm] then
+                    seen[nm] = true
+                    names[#names + 1] = nm
+                    _stat.newMod = _stat.newMod + 1
                 end
-            else
-                _add(full, ty, depth)
             end
         end
     end)
-    if not okf then
-        _add(path .. ".(遍历失败:" .. tostring(errf) .. ")", "?", depth)
-        return
-    end
-    if cnt == 0 then
-        _add(path .. ".(空表)", "empty", depth)
-    end
-end
+    _stat.rtPairs = tostring(okG)
 
-local function _scan(maxd)
-    _recs = {}
-    _seen = {}
-    _stat = { modOK = 0, modMiss = 0, rec = 0, t1 = 0, t2 = 0, t3 = 0 }
-    local missing = {}
-    for i = 1, #MODS do
-        local name = MODS[i]
-        local ok, obj = pcall(function() return _G[name] end)
-        if ok and obj ~= nil then
-            _stat.modOK = _stat.modOK + 1
-            _add(name, type(obj), 1)
-            if type(obj) == "table" then
-                _walk(obj, name, 2, maxd)
+    local seenTab = {}
+    local t0 = os.timeMs and os.timeMs() or 0
+
+    for i = 1, #names do
+        local mname = names[i]
+        local ok, m = pcall(function() return _G[mname] end)
+        local t = (ok and type(m) == "table") and m or nil
+        if not t then
+            if _setMods[mname] then
+                _stat.modMiss = _stat.modMiss + 1
+                _push(mname, "nil", "L0", "X")
             end
         else
-            _stat.modMiss = _stat.modMiss + 1
-            missing[#missing + 1] = name
+            _stat.modOk = _stat.modOk + 1
+            local src = _setMods[mname] and "D" or "R"
+            _push(mname, "table", "L0", src)
+            _stat.l0 = _stat.l0 + 1
+
+            local list = _members(t, cap)
+            for j = 1, #list do
+                local k2, v2 = list[j][1], list[j][2]
+                local kn = _keyname(k2)
+                local kd = _kind(v2)
+                local path2 = mname .. "." .. kn
+                if want(kd) then
+                    _push(path2, kd, "L1", src and "D" or "R")
+                    _stat.l1 = _stat.l1 + 1
+                end
+                -- 二层
+                if depth >= 2 and kd == "table" then
+                    local addr = tostring(v2)
+                    if not seenTab[addr] then
+                        seenTab[addr] = true
+                        if _setSubs[path2] then
+                            _push(path2, "table", "LS", "D")
+                            _stat.ls = _stat.ls + 1
+                        end
+                        local l2 = _members(v2, cap)
+                        for q = 1, #l2 do
+                            local k3, v3 = l2[q][1], l2[q][2]
+                            local kd3 = _kind(v3)
+                            if want(kd3) then
+                                local p3 = path2 .. "." .. _keyname(k3)
+                                _push(p3, kd3, "L2", _setSubs[path2] and "D" or "R")
+                                _stat.l2 = _stat.l2 + 1
+                            end
+                        end
+                    end
+                end
+            end
         end
     end
-    return missing
-end
 
-local function _line(r)
-    local mod, rest
-    local p = string.find(r.path, ".", 1, true)
-    if p then
-        mod = string.sub(r.path, 1, p - 1)
-        rest = string.sub(r.path, p + 1)
-    else
-        mod = r.path
-        rest = "(自身)"
-    end
-    return mod .. "|" .. rest .. "|" .. r.ty .. "|L" .. tostring(r.d)
+    local ms = (os.timeMs and os.timeMs() or 0) - t0
+    _say("[扫描] 模块在=" .. _stat.modOk .. " 缺失=" .. _stat.modMiss
+         .. " 新增=" .. _stat.newMod)
+    _say("[扫描] L1=" .. _stat.l1 .. " L2=" .. _stat.l2 .. " 子表=" .. _stat.ls)
+    _say("[扫描] 总记录=" .. _n .. " 耗时=" .. ms .. "ms _G遍历=" .. _stat.rtPairs)
+    return "总记录 " .. _n .. " 条 (L1=" .. _stat.l1 .. " L2=" .. _stat.l2 .. ")"
 end
 
 --------------------------------------------------------------------
--- 二维表
+-- ② 导出 (只用 1 张表, 一行放多条)
 --------------------------------------------------------------------
-local function _ids()
-    local ok, v = pcall(function() return Script.tableIdsText end)
-    if not ok then v = nil end
-    if type(v) == "string" and v ~= "" then
-        return _split(v, ",")
-    end
-    return {}
+local function _firstId(s)
+    if not s or s == "" then return nil end
+    for w in string.gmatch(s, "[^,;%s]+") do return w end
+    return nil
 end
 
-local function _autoPack(n)
-    if n <= 0 then return 1 end
-    local pk = 1
-    while pk * 1999 < n do
-        pk = pk + 1
-    end
-    return pk
+local function _packOf(n, want)
+    if want and want > 0 then return want end
+    local p = 1
+    while math.ceil(n / p) > 1999 do p = p + 1 end
+    return p
 end
 
---------------------------------------------------------------------
-function Script:OnStart()
-    print("[API探针v4] 已载入, 递归深度=" .. tostring(Script.maxDepth))
-    print("[API探针v4] 顺序: ①扫描全部 -> ②导出(只1张) -> ③校验")
-end
-
-function Script:ScanAll()
-    local maxd = Script.maxDepth or 2
-    if maxd < 1 then maxd = 1 end
-    local missing = _scan(maxd)
-    local out = {}
-    out[#out + 1] = "============== 扫描结果(含二层) =============="
-    out[#out + 1] = "模块 存在" .. tostring(_stat.modOK) .. " / 缺失" .. tostring(_stat.modMiss)
-    out[#out + 1] = "记录总数 " .. tostring(_stat.rec)
-    out[#out + 1] = "  L1=" .. tostring(_stat.t1) .. "  L2=" .. tostring(_stat.t2) .. "  L3+=" .. tostring(_stat.t3)
-    if #missing > 0 then
-        out[#out + 1] = "缺失: " .. _join(missing, ",")
+local function _lineOf(from, pack)
+    local buf = nil
+    local last = from + pack - 1
+    if last > _n then last = _n end
+    for i = from, last do
+        buf = buf and (buf .. ";" .. _recs[i]) or _recs[i]
     end
-    out[#out + 1] = "=============================================="
-    local s = _join(out, "\n")
-    print(s)
-    return "OK " .. tostring(_stat.rec) .. "条(L2=" .. tostring(_stat.t2) .. ")"
+    return buf
 end
 
 function Script:ExportTable()
-    if #_recs == 0 then return "ERR: 还没扫描, 请先点①" end
-    local ids = _ids()
-    if #ids < 1 then
-        return "ERR: 请在属性「输出二维表ID」填表ID(只用1张)"
+    if _n == 0 then return "ERR: 请先点①扫描" end
+    local id = _firstId(self.tableIdsText)
+    if not id then return "ERR: 未填输出二维表ID(属性tableIdsText)" end
+
+    local pack = _packOf(_n, self.packSize)
+    local rows = math.ceil(_n / pack)
+    if rows > 1999 then
+        return "ERR: 需要" .. rows .. "行但表上限1999 -> 把'每行合并几条'调到>="
+               .. _packOf(_n, 0) .. " (当前pack=" .. pack .. ")"
     end
-    local n = #_recs
-    local pk = Script.packSize or 0
-    if pk <= 0 then pk = _autoPack(n) end
-    local body = {}
-    local rn = 0
-    local i = 1
-    while i <= n do
-        local buf = {}
-        local c = 0
-        while c < pk and i <= n do
-            c = c + 1
-            buf[c] = _line(_recs[i])
-            i = i + 1
-        end
-        rn = rn + 1
-        body[rn] = _join(buf, ";")
-    end
-    if rn > 1999 then
-        return "ERR: 需要" .. tostring(rn) .. "行超2000 -> 把合并数调到 " .. tostring(_autoPack(n))
-    end
-    local tid = ids[1]
+
+    local head = "APIP2|V1|PK:" .. pack .. "|TC:" .. _n
+                 .. "|MOD:" .. (_stat.modOk or 0)
+                 .. "|L1:" .. (_stat.l1 or 0)
+                 .. "|L2:" .. (_stat.l2 or 0)
+                 .. "|LS:" .. (_stat.ls or 0)
+                 .. "|LEN:" .. rows
+
     local ok, err = pcall(function()
-        Data.Table:Clear(tid, nil)
-        Data.Table:InsertValue(tid, nil,
-            "APIR|V4|REC:" .. tostring(n) .. "|PK:" .. tostring(pk) .. "|DEP:" .. tostring(Script.maxDepth or 2))
-        for r = 1, rn do
-            Data.Table:InsertValue(tid, nil, body[r])
-        end
+        Data.Table:Clear(id, nil)
+        Data.Table:InsertValue(id, nil, head)
     end)
-    if not ok then return "ERR: 写入失败 " .. tostring(err) end
-    print("[导出] " .. tostring(rn) .. "行 x 每行" .. tostring(pk) .. "条 -> 1张表 id=" .. tostring(tid))
-    return "OK " .. tostring(rn) .. "行; 点③校验"
+    if not ok then return "ERR: 写头部失败 " .. tostring(err) end
+
+    local wrote = 0
+    for r = 1, rows do
+        local from = (r - 1) * pack + 1
+        local ok2, err2 = pcall(function()
+            Data.Table:InsertValue(id, nil, _lineOf(from, pack))
+        end)
+        if not ok2 then
+            return "ERR: 写第" .. r .. "行失败 " .. tostring(err2)
+        end
+        wrote = wrote + 1
+    end
+    _stat.exported = { id = id, pack = pack, rows = rows }
+    return "OK: " .. _n .. "条 -> pack=" .. pack .. " -> " .. rows
+           .. "行(含头部" .. (rows + 1) .. ") 表=" .. tostring(id)
 end
 
+--------------------------------------------------------------------
+-- ③ 校验导出
+--------------------------------------------------------------------
 function Script:VerifyExport()
-    local ids = _ids()
-    if #ids < 1 then return "ERR: 未填表ID" end
-    local tid = ids[1]
-    local ok, rows = pcall(function() return Data.Table:GetAllValue(tid, nil) end)
-    if not ok then return "ERR: 读回失败 " .. tostring(rows) end
-    if type(rows) ~= "table" or #rows == 0 then
-        return "★校验无效: 读回0行(表空或未写入), 不能算通过"
+    local id = _firstId(self.tableIdsText)
+    if not id then return "ERR: 未填输出二维表ID" end
+    local all = nil
+    local ok, err = pcall(function() return Data.Table:GetAllValue(id, nil) end)
+    if not ok then return "ERR: GetAllValue失败 " .. tostring(err) end
+    all = err
+    if type(all) ~= "table" or #all == 0 then
+        return "★校验无效: 读回空(表ID错?没导出?) type=" .. type(all)
     end
-    local pk = 1
-    local h = rows[1]
-    local hv = ""
-    if type(h) == "table" then hv = tostring(h[1]) else hv = tostring(h) end
-    local p = string.find(hv, "PK:", 1, true)
-    if p then pk = tonumber(string.sub(hv, p + 3)) or 1 end
-    local got, bad, firstBad = 0, 0, ""
-    for i = 2, #rows do
-        local r = rows[i]
-        local v = ""
-        if type(r) == "table" then v = tostring(r[1]) else v = tostring(r) end
-        local parts = _split(v, ";")
-        for j = 1, #parts do
-            got = got + 1
-            local want = nil
-            if got <= #_recs then want = _line(_recs[got]) end
-            if want and parts[j] ~= want then
-                bad = bad + 1
-                if firstBad == "" then
-                    firstBad = "行" .. tostring(i) .. "第" .. tostring(j) .. "条 期望[" .. want .. "] 实得[" .. parts[j] .. "]"
+
+    local head = all[1] and all[1][1] or nil
+    if type(head) ~= "string" or string.sub(head, 1, 6) ~= "APIP2|" then
+        return "★校验无效: 第1行不是APIP2头部 -> " .. tostring(head)
+    end
+    local pk = tonumber(string.match(head, "PK:(%d+)")) or 1
+    local tc = tonumber(string.match(head, "TC:(%d+)")) or 0
+
+    local got, bad = 0, 0
+    local firstBad = nil
+    for i = 2, #all do
+        local row = all[i] and all[i][1] or nil
+        if type(row) ~= "string" then
+            bad = bad + 1
+        else
+            local pos = 1
+            for w in string.gmatch(row, "[^;]+") do
+                got = got + 1
+                local want = _recs[got]
+                if want ~= w then
+                    bad = bad + 1
+                    if not firstBad then
+                        firstBad = "第" .. i .. "行第" .. pos .. "条: 读回["
+                                   .. tostring(w) .. "] 期望[" .. tostring(want) .. "]"
+                    end
                 end
+                pos = pos + 1
             end
         end
     end
-    local out = {}
-    out[#out + 1] = "头部: " .. hv
-    out[#out + 1] = "读回" .. tostring(#rows - 1) .. "行, 展开" .. tostring(got) .. "条, 内存记录" .. tostring(#_recs) .. "条"
     if got == 0 then
-        return "★校验无效: 展开0条 -> 第1列不是数据(检查InsertValue是否只传1个字符串)"
+        return "★校验无效: 读回" .. (#all - 1) .. "行但0条内容(拆包失败?)"
     end
-    if bad == 0 and got == #_recs then
-        out[#out + 1] = "★★校验通过 " .. tostring(got) .. "条逐条一致"
-    else
-        out[#out + 1] = "★校验失败 不一致" .. tostring(bad) .. "处; 首个: " .. firstBad
+    if bad > 0 then
+        return "★校验失败: 读回" .. got .. "条, 不一致" .. bad
+               .. " 首个=" .. tostring(firstBad)
     end
-    local s = _join(out, "\n")
-    print(s)
-    return s
+    if tc > 0 and got ~= tc then
+        return "★数量不符: 头部TC=" .. tc .. " 实读" .. got
+    end
+    return "PASS: 读回" .. (#all - 1) .. "行 x pack" .. pk .. " = " .. got
+           .. "条, 逐条一致(0不一致)"
 end
 
+--------------------------------------------------------------------
+-- ④ 分块打印
+--------------------------------------------------------------------
 function Script:DumpBlocks()
-    if #_recs == 0 then return "ERR: 先点①扫描" end
-    local lines = {}
-    for i = 1, #_recs do lines[i] = _line(_recs[i]) end
-    local nb = _printBlocks("全量(含二层)", lines)
-    return "OK " .. tostring(#lines) .. "条分" .. tostring(nb) .. "块"
+    if _n == 0 then return "ERR: 请先点①扫描" end
+    local lim = self.printMax or 400
+    if lim > _n then lim = _n end
+    _emit("===== 扫描结果 前" .. lim .. " / 共" .. _n .. " =====")
+    for i = 1, lim do _emit(i .. " " .. _recs[i]) end
+    local a, b = _flush(self.blockBytes or 500)
+    return "已打印 " .. lim .. " 条 / " .. a .. "块 / " .. b .. "字节"
 end
 
+--------------------------------------------------------------------
+-- ⑤ 指定模块  ⑥ 查找  ⑦ 事件  ⑧ 对照  ⑨ 自检
+--------------------------------------------------------------------
 function Script:ShowModule(name)
-    name = _trim(name)
-    if name == "" then return "ERR: 填模块名, 如 Data" end
-    local lines, c = {}, 0
-    for i = 1, #_recs do
-        local p = string.find(_recs[i].path, ".", 1, true)
-        local mod = _recs[i].path
-        if p then mod = string.sub(_recs[i].path, 1, p - 1) end
-        if mod == name then
-            c = c + 1
-            lines[c] = _line(_recs[i])
+    if _n == 0 then return "ERR: 请先点①扫描" end
+    if not name or name == "" then return "ERR: 填模块名, 如 Data" end
+    local hit = 0
+    _emit("===== 模块 " .. name .. " =====")
+    for i = 1, _n do
+        local r = _recs[i]
+        local p = string.match(r, "^([^|]+)")
+        if p == name or string.sub(p, 1, #name + 1) == name .. "." then
+            _emit(r); hit = hit + 1
         end
     end
-    if c == 0 then return "模块[" .. name .. "] 无记录" end
-    _printBlocks("模块 " .. name, lines)
-    return "OK " .. tostring(c) .. "条"
+    _flush(self.blockBytes or 500)
+    return "命中 " .. hit .. " 条"
 end
 
-function Script:FindMember(kw)
-    kw = _trim(kw)
-    if kw == "" then return "ERR: 填关键字" end
-    local lines, c = {}, 0
-    for i = 1, #_recs do
-        if string.find(_recs[i].path, kw, 1, true) then
-            c = c + 1
-            lines[c] = _line(_recs[i])
+function Script:FindMember(key)
+    if _n == 0 then return "ERR: 请先点①扫描" end
+    if not key or key == "" then return "ERR: 填关键字, 如 Map" end
+    local hit, lim = 0, self.printMax or 400
+    _emit("===== 含 " .. key .. " =====")
+    for i = 1, _n do
+        if string.find(_recs[i], key, 1, true) then
+            if hit < lim then _emit(_recs[i]) end
+            hit = hit + 1
         end
     end
-    if c == 0 then return "无匹配: " .. kw end
-    _printBlocks("匹配 " .. kw, lines)
-    return "OK " .. tostring(c) .. "条"
+    _flush(self.blockBytes or 500)
+    return "命中 " .. hit .. " 条"
 end
 
 function Script:DumpEvents()
-    local ok, t = pcall(function() return TriggerEvent end)
-    if not ok or type(t) ~= "table" then return "ERR: TriggerEvent 不可访问" end
-    local keys, c = {}, 0
-    for k, v in pairs(t) do
-        c = c + 1
-        keys[c] = tostring(k) .. " = " .. tostring(v)
-    end
-    if c == 0 then return "TriggerEvent 是空表" end
-    table.sort(keys)
-    _printBlocks("TriggerEvent(" .. tostring(c) .. ")", keys)
-    return "OK " .. tostring(c) .. "个事件常量"
-end
-
-function Script:Summary()
-    if #_recs == 0 then return "ERR: 先点①扫描" end
-    local cnt, order = {}, {}
-    for i = 1, #_recs do
-        local p = string.find(_recs[i].path, ".", 1, true)
-        local mod = _recs[i].path
-        if p then mod = string.sub(_recs[i].path, 1, p - 1) end
-        if not cnt[mod] then
-            cnt[mod] = 0
-            order[#order + 1] = mod
+    _emit("===== 事件表 =====")
+    local cnt = 0
+    local list = { "TriggerEvent", "ObjectEvent", "ActorEvent", "PlayerEvent",
+                   "BlockEvent", "ItemEvent", "UIEvent", "MonsterEvent" }
+    for i = 1, #list do
+        local nm = list[i]
+        local t = nil
+        pcall(function() t = _G[nm] end)
+        if type(t) ~= "table" then
+            _emit("-- " .. nm .. " 不存在")
+        else
+            local ms = _members(t, 2000)
+            _emit("-- " .. nm .. " (" .. #ms .. ")")
+            for j = 1, #ms do
+                _emit("   " .. nm .. "." .. _keyname(ms[j][1])
+                      .. " = " .. _kind(ms[j][2]))
+                cnt = cnt + 1
+            end
         end
-        cnt[mod] = cnt[mod] + 1
     end
-    table.sort(order, function(a, b) return cnt[a] > cnt[b] end)
-    local out = {}
-    out[#out + 1] = "============== 摘要 =============="
-    out[#out + 1] = "模块 存在" .. tostring(_stat.modOK) .. " 缺失" .. tostring(_stat.modMiss)
-    out[#out + 1] = "记录 " .. tostring(_stat.rec) .. " (L1=" .. _stat.t1 .. " L2=" .. _stat.t2 .. " L3+=" .. _stat.t3 .. ")"
-    local lim = 15
-    if #order < lim then lim = #order end
-    for i = 1, lim do
-        out[#out + 1] = "  " .. order[i] .. " : " .. tostring(cnt[order[i]]) .. "条"
-    end
-    out[#out + 1] = "=================================="
-    local s = _join(out, "\n")
-    print(s)
-    return s
+    _flush(self.blockBytes or 500)
+    return "事件成员 " .. cnt .. " 个"
 end
 
-function Script:SelfTest()
+function Script:DiffDump()
+    if _n == 0 then return "ERR: 请先点①扫描" end
+    if not _setMods.__loaded then
+        _fill(_setMods, DUMP_MODS); _fill(_setSubs, DUMP_SUBS)
+        _setMods.__loaded = true
+    end
+    local miss, newm = {}, {}
+    for i = 1, _n do
+        local r = _recs[i]
+        local lv = string.match(r, "|(%w+)|%w+$")
+        if lv == "L0" then
+            local p = string.match(r, "^([^|]+)")
+            local src = string.match(r, "|(%w+)$")
+            if src == "X" then miss[#miss + 1] = p
+            elseif src == "R" then newm[#newm + 1] = p end
+        end
+    end
+    _emit("===== 与转储对照 =====")
+    _emit("[转储] 模块" .. _words(DUMP_MODS) .. " 二层子表" .. _words(DUMP_SUBS))
+    _emit("[实机缺失] " .. #miss)
+    for i = 1, #miss do if i <= 60 then _emit("  - " .. miss[i]) end end
+    _emit("[运行时新增] " .. #newm)
+    for i = 1, #newm do if i <= 60 then _emit("  + " .. newm[i]) end end
+    _flush(self.blockBytes or 500)
+    return "缺失 " .. #miss .. " / 新增 " .. #newm
+end
+
+function Script:EnvInfo()
     local pass, fail = 0, 0
-    local out = {}
-    local function ck(cond, name)
-        if cond then pass = pass + 1; out[#out + 1] = "[PASS] " .. name
-        else fail = fail + 1; out[#out + 1] = "[FAIL] " .. name end
+    local function chk(cond, msg)
+        if cond then pass = pass + 1 _emit("PASS " .. msg)
+        else fail = fail + 1 _emit("FAIL " .. msg) end
     end
-    ck(type(_G) == "table", "_G 是 table")
-    ck(#MODS > 200, "内置模块清单 " .. tostring(#MODS) .. " 个")
-    ck(type(os.timeMs) == "function", "os.timeMs 可调用")
-    ck(os.clock == nil, "os.clock 不存在(符合预期)")
-    local dok = pcall(function() return type(Data) end)
-    ck(dok and type(Data) == "table", "模块 Data 存在")
-    local dtk = pcall(function() return type(Data.Table) end)
-    ck(dtk, "Data.Table 可访问")
-    local dmk = pcall(function() return type(Data.Map) end)
-    ck(dmk, "Data.Map 可访问")
-    _scan(Script.maxDepth or 2)
-    ck(_stat.rec > 1000, "扫描产出 " .. tostring(_stat.rec) .. " 条")
-    ck(_stat.t2 > 0, "二层记录 " .. tostring(_stat.t2) .. " 条(>0=探到了)")
-    print("============== 自检 ==============")
-    print(_join(out, "\n"))
-    print("通过 " .. tostring(pass) .. " / 失败 " .. tostring(fail))
-    print("==================================")
-    return "自检 " .. tostring(pass) .. "通过 / " .. tostring(fail) .. "失败"
+    if not _setMods.__loaded then
+        _fill(_setMods, DUMP_MODS); _fill(_setSubs, DUMP_SUBS)
+        _setMods.__loaded = true
+    end
+    _emit("===== ⑨ 自检 =====")
+    chk(_VERSION == "Lua 5.1" or _VERSION ~= nil, "_VERSION=" .. tostring(_VERSION))
+    chk(type(Script.propertys) == "table", "propertys 是表")
+    chk(type(Script.openFnArgs) == "table", "openFnArgs 是表")
+    local nf = 0
+    for k, v in pairs(Script) do
+        if type(v) == "table" and k ~= "propertys" and k ~= "openFnArgs" then
+            nf = nf + 1
+        end
+    end
+    chk(nf == 0, "非函数字段仅 propertys/openFnArgs (多出" .. nf .. ")")
+    chk(_words(DUMP_MODS) > 250, "内置模块名 " .. _words(DUMP_MODS) .. " (>300)")
+    chk(_words(DUMP_SUBS) > 100, "内置二层子表 " .. _words(DUMP_SUBS) .. " (>100)")
+    chk(type(os.timeMs) == "function", "os.timeMs 可调用")
+    if type(os.clock) == "function" then
+        _emit("NOTE os.clock 存在(沙盒5.5); 真机5.1无此函数, 用了必崩")
+    else
+        _emit("PASS os.clock 不存在(与真机5.1一致)")
+    end
+    chk(type(print) == "function", "print 可用")
+    chk(type(pairs) == "function", "pairs 可用")
+    chk(_G ~= nil, "_G 可读")
+    -- 二层是否真探到
+    if _n == 0 then
+        _emit("SKIP 二层检查(还没点①扫描)")
+    else
+        local has2, hasLS = 0, 0
+        for i = 1, _n do
+            if string.find(_recs[i], "|L2|", 1, true) then has2 = has2 + 1 end
+            if string.find(_recs[i], "|LS|", 1, true) then hasLS = hasLS + 1 end
+        end
+        chk(has2 > 0, "探到二层成员 " .. has2 .. " 条")
+        chk(hasLS > 0, "探到二层子表 " .. hasLS .. " 个")
+        chk(_n == #_recs, "记录数连续 n=" .. _n .. " #=" .. #_recs)
+        chk(_packOf(_n, 0) >= 1, "自动pack=" .. _packOf(_n, 0)
+            .. " -> " .. math.ceil(_n / _packOf(_n, 0)) .. "行(<=1999)")
+    end
+    _emit("---- " .. pass .. " 通过 / " .. fail .. " 失败 ----")
+    _flush(self.blockBytes or 500)
+    return pass .. " 通过 / " .. fail .. " 失败"
 end
 
+--------------------------------------------------------------------
 return Script
