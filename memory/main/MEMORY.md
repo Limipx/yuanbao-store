@@ -771,6 +771,38 @@ Data.Table:函数API  ← 二维表
 - `sort`（面板排列序号，小的在前）**确认生效**
 - `Mini.CustomData` 的 `customDef` **支持任意深度嵌套**（字段可以是 CustomData 或 Array，递归无层数限制）
 
+## ⛔ Mini.CustomData 两种出现位置（商店自定义2.lua 实证，2026-10-19 lupa 实跑）
+| | A 数组元素 | B 普通字段 |
+|---|---|---|
+| type | `Mini.Array` | `Mini.CustomData` |
+| itemType | `Mini.CustomData` | —（不写） |
+| customDef | ✅ | ✅ |
+| 显示名 | `customDisplayName` + `displayName` | 只有 `displayName` |
+
+- **B 形（字段直接是 CustomData，不经 Array）实证**：`price = {type=Mini.CustomData, customDef={currency=…, amount=…}}`
+- **运行时 = 纯 Lua table**，键名 = `customDef` 键名；实测 5 层链取值全通
+  `self.categories[1].subcategories[1].products[1].price.currency`
+- ⛔ `customDef` 键名 = 运行时键名 → **混淆/重命名不能改**，改了静默 nil
+- ⚠️ 增删改只在内存副本，**不回写属性面板**（实测改 shopData 后 self.categories[1].name 不变）
+- 路径表达式里数组索引必须 `[1]`，写 `1.name` → nil
+- `itemType=Mini.CustomData` 时 `default` 写法【未验证】→ 先别写
+- `default` 两种写法并存：字面量表 `{a,b,c}`（商店脚本）与 `Mini.Array(Mini.String,…)`（旧脚本）
+- 详见 `Mini.CustomData_格式与用法.md`（含商店脚本自身 6 个坑：ArrayInsertProduct 一调就崩
+  `attempt to get length of a nil value (field 'categories')`）
+
+## ✅ Data.Array 实机签名（商店脚本实证，与 Data.Table 参数个数不同）
+```
+Data.Array:GetSize(varId)                          -- 2 参
+Data.Array:GetValue(varId, nil, i)                 -- 3 参
+Data.Array:InsertValue(varId, nil, value, pos)     -- 4 参（可指定位置）
+Data.Array:Remove(varId, nil, i)                   -- 3 参
+```
+⛔ 与 `Data.Table:InsertValue(tableId, nil, "一个字符串")`（3 参）**不同**，禁止互相套用。
+
+## ✅ openFnArgs params 格式再确认（商店脚本 7 个声明实测）
+项数 **1/5/5/5/7/9/9 全为奇数** = 「名、类型交替 + 末项是返回名（无类型）」。
+⛔ 实现了但没写进 `openFnArgs` 的函数（如 AddCurrency/RemoveCurrency）→ **触发器调不到**。
+
 
 ## 引擎 API 转储结构（apitool/dump_parsed.json）— 2025-10-18 实测
 - **结构**：扁平字典，`key="A.B.C"` 路径，`value=[type, args]`（type ∈ table/function/value）

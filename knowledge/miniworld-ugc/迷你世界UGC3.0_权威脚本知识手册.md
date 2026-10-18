@@ -342,6 +342,42 @@ ITEMTYPEGROUP=21  CREATURETYPEGROUP=22  TIMERGROUP=23  EFFECTTYPEGROUP=24
 可以是另一个 `Mini.CustomData`，也可以是 `Mini.Array`，递归下去没有层数限制。
 所以可以把整个配置树铺成一个属性，面板上逐层展开编辑。
 
+### ⛔ 两种出现位置，写法不同（商店自定义2.lua 实证，2026-10-19）
+
+| | **A · 数组元素** | **B · 普通字段** |
+|---|---|---|
+| `type` | `Mini.Array` | `Mini.CustomData` |
+| `itemType` | `Mini.CustomData` | — |
+| `customDef` | ✅ | ✅ |
+| 显示名 | `customDisplayName` + `displayName` | `displayName`（**没有** customDisplayName） |
+
+**B 形（字段直接是 CustomData，不必经过 Array）**：
+
+```lua
+price = {
+    type = Mini.CustomData, displayName = "价格",
+    customDef = {
+        currency = { type = Mini.String, displayName = "货币类型", default = "gold" },
+        amount   = { type = Mini.Number, displayName = "数量", minValue = 0 }
+    }
+}
+```
+
+> 之前只有「Array 里嵌 CustomData」的例子，B 形是商店脚本补上的新证据。
+
+**运行时 = 纯 Lua table，键名就是 `customDef` 的键名**（实测 5 层取值全通）：
+
+```
+self.categories[1].subcategories[1].products[1].price.currency  → gold
+```
+
+- ⛔ `customDef` 键名 = 运行时键名，**混淆/重命名不能改**，改了静默取 nil
+- ⚠️ 增删改只作用在内存副本上，**不回写属性面板**（实测：改了 shopData 后 `self.categories[1].name` 不变）→ 要持久化自己写 `Data.Map` / `Array` / `Table`
+- 数组索引在路径表达式里必须写**中括号**：`[1].name` 有效，`1.name` → nil
+- `itemType=Mini.CustomData` 时 `default` 怎么写【未验证】→ 先不写
+
+详见独立文档 **`Mini.CustomData_格式与用法.md`**（含实测原始输出与脚本自身 6 个坑）。
+
 ⚠️ **区分两套 CustomData**：组件属性的 `Mini.CustomData`（`customDef`）vs
 道具实例 CustomData（`Item:Set/GetStringCustomData` 等，`instId + key + value`）。名字一样，不是一回事。
 
