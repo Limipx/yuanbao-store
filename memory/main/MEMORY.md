@@ -788,3 +788,57 @@ MAX 2000 行
 - `CloudSever` 官方只有 3 个接口：`SetDataListBykey` / `GetDataListByKey`（带 callback）/ `GetRoomID`。
   真机反射里另有 `SetDataListValue`、`TransmitToCategoryRoom` 等，官方未文档化。
 - `Data` 真机反射含 `Array` / `Map` / `Table` 三个子表 + 4 个函数；云服旧模块 `CloudSever` 已作废，走 `Data.Map`。
+
+---
+
+# 【2026-10-18 重写】miniworld-ugc 知识库合并为单一主文档
+
+**主文档**：`knowledge/miniworld-ugc/迷你世界UGC3.0_权威脚本知识手册.md`（861 行 / 34826 字节）
+旧 10 篇已并入并归档到 `_deprecated/`（含 README 说明哪些整体废除、哪些部分失效）。
+
+## 用户本轮两条明确指令（写进纪律）
+
+### ① Trigger 主要是 **TriggerEvent 事件注册**，是最重要的模块
+
+- 组件脚本：`self:AddTriggerEvent(TriggerEvent.Xxx, self.Handler)`
+- 官方签名：`AddTriggerEvent(string 事件类型, function 回调, [过滤参1], [过滤参2])` → 无返回
+- ⚠️ **该函数只在 UI 跟世界类型组件有效**
+- `TriggerEvent.Xxx` 的值 = 字符串事件名（252 个常量全部有值），
+  与旧 `ScriptSupportEvent:registerEvent([=[Player.ClickBlock]=], fn)` **完全等价**
+- 事件参数九类统一：eventobjid / x,y,z / blockid / itemid / itemnum / toobjid / targetactorid 等
+- 回调里另有 `event.CurEventParam`
+
+### ② threadpool / json / coroutine / os / bit 确定存在，**必须用，禁止降级兜底**
+
+```
+bit         12 成员全在（含 ror！）  bit.lshift(1,31) = -2147483648 → 有符号32位
+json        json.encode / json.decode（官方全局函数页）
+threadpool  threadpool:wait(秒) —— 官方 FAQ「如何等待1秒」的标准答案
+coroutine   7 成员含 isyieldable
+os          date / time / timeMs（无 clock，用了必崩）
+```
+
+**历史事故**：真随机数 v2 注释写「bit 只有 rol 没有 ror（**记忆实测**）」→ 绕开原生自拼。
+**ror 其实在 12 成员里。**「记忆实测」四个字就是病根。
+→ 纪律已立：凡"引擎某 API 存不存在"必须回查转储/探针，**禁止凭记忆、禁止注释里写"（实测）"**。
+
+## 本轮新确认的官方事实（此前未记录）
+
+- `self:DoPeriodicTask(fn, 秒[, 延迟, 次数])` / `self:DoTaskInTime(fn, 秒)` **引擎自带定时器**
+  → 新脚本**优先用它**，不要再自造广播自驱动泵
+- `self:ThreadWork(function() end)` 启动协程 / `self:ThreadWait(秒)` 等待（默认一帧）
+- `self:PushCloudServerMsg(类型, 内容...)` 云服广播；第三参可定向房间
+- 匿名广播回调签名 `(cmp, eventId, param1...)` —— **载荷在第 3 参**
+- 全局函数：`json.*` / `printError` / `Class` / `Instance` / `GetInst` / `GetWorld`
+- 官方 8 种组件类型；世界组件 / 玩家组件 / 生物 / 实体 / 方块 / 界面 / 状态×2
+
+## 已废除（勿再用）
+
+- ~~引擎是 LuaJIT / FFI 可见~~（jit=nil ffi=nil）
+- ~~bit 只有 rol 没有 ror~~
+- ~~math.tanh 不存在需自带~~（引擎 math 34 成员全有）
+- ~~table.concat 不是函数~~（那是 lupa 5.5 沙盒，不是引擎）
+- ~~导出二维表分片多张表~~（只用 1 张，一行放多条）
+- ~~Data.Map:GetMapValue~~（真机不存在）
+- **`Lua5.1数学库缺失与实测坑.md` 整体废除**（前提就是错的）
+
