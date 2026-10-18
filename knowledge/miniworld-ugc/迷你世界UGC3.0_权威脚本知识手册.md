@@ -23,6 +23,11 @@
    均已确认存在。**为它们写"自拼/自实现"的降级路径是错的**——
    既慢，又会把真 bug 藏进兜底分支里（见 §11 列举的 4 次事故）。
 
+4. **选存储载体，先看"能不能放不可打印字符"。**
+   `Data.Map` / `Data.Array` 的 value **可以放原始字节**；
+   `Data.Table`（二维表）的值**只能是任意可打印字符**。
+   这一条决定了要不要套 base85 —— 套错方向就是白丢 25% 体积加编解码开销（见 §8.5）。
+
 ---
 
 # 一、运行环境硬事实
@@ -284,12 +289,15 @@ displayName 属性别名（面板显示名）
 permission  访问权限：默认 Public / CmpProPermission.Private / Read
 isSave      是否自动持久化：false = 不存
 minValue / maxValue   数值范围（注意是 minValue，不是 min）
+tips        ✅【真机确认生效】面板上的提示文字（鼠标悬停/属性下方说明）
+sort        ✅【真机确认生效】属性在面板中的排列序号（小的在前）
 ```
 
 **`isSave` 很重要**：`false` → 不自动落地，每次进游戏或出区块重载都取默认值。
 默认自动落地保存。官方建议**用组件属性存数据，而不是全局变量**。
 
-⚠️ `tips` / `sort` 官网没提，用户手册里有，**待真机验证**。
+> ✅ **`tips` / `sort` 已由用户真机确认生效**（2026-10-18）。官网没写但确实起作用，
+> 可以放心使用。`sort` 用于把常用属性排到前面，避免面板里翻找。
 
 ## 4.2 属性类型：官网 13 种 vs 手册 50+ 种
 
@@ -316,7 +324,7 @@ ITEMTYPEGROUP=21  CREATURETYPEGROUP=22  TIMERGROUP=23  EFFECTTYPEGROUP=24
 
 【推测】组类型很可能就是 `Mini.Array(元素类型)` 的实现（`itemType` + `maxNum`）。
 
-## 4.4 Mini.CustomData：嵌套结构
+## 4.4 Mini.CustomData：✅ 支持任意层级嵌套
 
 ```lua
 {
@@ -329,6 +337,10 @@ ITEMTYPEGROUP=21  CREATURETYPEGROUP=22  TIMERGROUP=23  EFFECTTYPEGROUP=24
     }
 }
 ```
+
+✅ **【真机确认】`customDef` 支持任意深度嵌套** —— 一个 `Mini.CustomData` 的字段
+可以是另一个 `Mini.CustomData`，也可以是 `Mini.Array`，递归下去没有层数限制。
+所以可以把整个配置树铺成一个属性，面板上逐层展开编辑。
 
 ⚠️ **区分两套 CustomData**：组件属性的 `Mini.CustomData`（`customDef`）vs
 道具实例 CustomData（`Item:Set/GetStringCustomData` 等，`instId + key + value`）。名字一样，不是一回事。
@@ -589,14 +601,38 @@ self:PushCustomEvent(broadcastId, identify, funcName, ...)
 # 八、数据存储：Data 三子表 + 二维表铁律
 
 转储：`Data` 含 `Array` / `Map` / `Table` 三个子表 + 4 个函数。
-**云服旧模块 `CloudSever`（注意是 Sever 不是 Server）已作废，走 `Data.Map`。**
 
-## 8.1 ⛔⛔ 二维表限制（用户强调无数次）
+### ⛔⛔ 两条"明确废除"，看到就别用
 
-| 方向 | 限制 |
-|---|---|
-| **导入** | **500KB 内存 + 2000 行** |
-| **导出** | **只有 2000 行，没有内存限制** |
+1. **`CloudSever`（注意是 Sever 不是 Server）已明确废除** ——
+   云服存储一律走 **`Data.Map`**。任何还调用 `CloudSever:Xxx` 的脚本都应重写。
+   （历史脚本如《行为分析指纹3.lua》用过，已作废。）
+2. **`Studio` 系列仅适用于 Mini Studio，不适用于 UGC 3.0** ——
+   `game:GetService` / Studio 版 `CloudService` 那一套在 UGC 3.0 组件脚本里
+   **不成立**。别把 Mini Studio 的写法搬过来。
+
+## 8.1 ⛔⛔ 二维表限制（用户强调无数次 / 2026-10-18 最终版）
+
+### 行数与体积
+
+| 方向 | 行数上限 | 体积上限 |
+|---|---|---|
+| **导入** | **2000 行** | **500KB** |
+| **导出** | **2000 行** | **无限制** |
+
+> **唯一限制就是 2000 行**。导入另加 500KB；导出没有内存限制，
+> 所以**导出永远只开 1 张表**，把多条拼进一行即可，绝不分片成多张表。
+
+### ✅ 值的格式规则（真机确认）
+
+1. 值可以是**任意可打印字符**（不可打印字符不行）
+2. **没有换行**的前提下，值内部可以直接含 `"` 和 `,`
+3. 用 `""` 包围的字符串，**类型明确为 string 时可以不加引号**
+4. **单行长度无明确限制，可以到 500KB**
+5. **转义字符可加可不加**（加了也对，不加也对）
+
+> 这条直接推翻了之前"必须引号包裹才安全"的写法——**引号只是可选的语法糖**，
+> 真正的硬约束只有"不能有换行"和"必须是可打印字符"。
 
 **结论：导出一律只用 1 张表 —— 一行里放多条就行，绝不是分多张表。**
 
@@ -608,7 +644,21 @@ self:PushCustomEvent(broadcastId, identify, funcName, ...)
 
 > **历史错误**：探针 v1/v2 按行数分片成 3~4 张表，还报"表不够还差几张"——用户明明说过导出没内存限制。
 
-## 8.2 ⛔ Data.Table 实机签名（以 建筑文件生成器3.1 为准，**禁止照转储猜**）
+## 8.2 ⛔⛔ Data 模块：四套 API 并存（**禁止只认 Data.Table**）
+
+✅ **【真机确认】`Data` 下有四个层级，各自都有函数**：
+
+```
+Data:函数API         ← Data 模块自身也有函数（不是只有三个子表）
+Data.Map:函数API     ← KV 表 / 排行榜
+Data.Array:函数API   ← 数组表
+Data.Table:函数API   ← 二维表
+```
+
+⚠️ 之前的笔记只写了 `Map / Table / Array` 三个子表，漏了 **`Data:` 自身也有函数**。
+查 API 时四个都要探。
+
+### Data.Table 实机签名（以 建筑文件生成器3.1 为准，**禁止照转储猜**）
 
 ```lua
 Data.Table:Clear(tableId, nil)
@@ -670,7 +720,7 @@ SetRankValueAndBlock / ClearData
 **入参**：`varId`(string) `playerId`(number|nil 全局传 nil) `key`(string) `value`(string|number|boolean) `callback`(function)
 **返回**：`code`(ErrorCode) `key` `value` [排行榜额外：`index` `ascending` `extendinfo`]
 
-### ⛔ 三个硬限制
+### ⛔ 四个硬限制
 
 1. **不支持自定义 table** —— 必须自己序列化（`json.encode`）
 2. **请求频率限流**（按在线人数动态分配）
@@ -680,7 +730,84 @@ SetRankValueAndBlock / ClearData
 | 设置 / 获取 | `30 + numPlayers × 10` |
 | **排行榜** | **`5 + numPlayers × 2`（最严格，约 KV 的 1/5）** |
 
-3. 数据长度限制（每条有大小上限）
+3. **✅【真机确认】Key 的大小与字符集（最容易被忽视）**
+
+| | 限制 |
+|---|---|
+| 长度 | **≤ 50 字节** |
+| 字符 | **必须是可打印单字节字符** |
+| 排除 | **空格被排除**（Key 里不能含空格） |
+
+> 中文是多字节 → 占 2~3 字节，50 字节只够约 16~25 个汉字。
+> 建议 Key 一律用 ASCII（字母/数字/`_`/`-`），既省字节又避开空格问题。
+
+4. **✅【真机确认】value 的大小与字符集**
+
+| | 限制 |
+|---|---|
+| 长度 | **≤ 2MB** |
+| 字符 | **可以是任意不可打印字符**（即能当比特流存） |
+
+> 这是 `Data.Map` 相对二维表的**最大优势**：二维表的值只能是可打印字符，
+> 而 `Data.Map` 的 value 可以塞原始字节。所以存压缩后的二进制、
+> 存 base85/base256 比特流，**只有 `Data.Map` / `Data.Array` 能干**。
+
+## 8.5 ⛔ 字符串与比特流存储规则（2026-10-18 真机确认）
+
+**一句话：能不能用不可打印字符，取决于走哪套 API。**
+
+| 载体 | 值能否含不可打印字符 | 单条容量上限 |
+|---|---|---|
+| **Data.Table（二维表）** | ❌ **不行**，只能是任意可打印字符 | 单行无明确限制（可到 500KB）；**表限 2000 行** |
+| **Data.Map 的 Key** | ❌ 不行，且必须是可打印单字节、**排除空格** | **≤ 50 字节** |
+| **Data.Map 的 value** | ✅ **可以**（可当比特流） | **≤ 2MB** |
+| **Data.Array** | ✅ **可以** | 见下 |
+| **其余所有字符串** | ✅ 可以 | **≤ 50MB** |
+
+### 推论（很实用）
+
+- **存二进制/压缩数据 → 选 `Data.Map` 或 `Data.Array`，不要选二维表。**
+  二维表只能走 base85 这类"全可打印字符"编码，凭空多 25% 体积；
+  `Data.Map` 可直接放原始字节，**省掉编码层，也省掉解码开销**。
+- **二维表的"可打印字符"约束是硬性的**——不可打印字符（含 `\0`、换行）会导致
+  解析错位或写入失败，且**往往不报错**。所以在二维表路径上，base85 仍然是正解。
+- **50MB 是普通字符串的天花板**，比 KV 的 2MB 宽松得多，但注意那是**单条**上限，
+  不是总量——总量还要受存档/云服配额约束。
+
+### 容量速查（从紧到松）
+
+```
+Data.Map Key    50 字节   ← 最紧，且不许空格
+Data.Map value  2 MB
+二维表单行      500 KB（单行无硬限，导入整体 500KB / 2000 行）
+其余字符串      50 MB
+导出            无内存限制（唯一限制 2000 行）
+```
+
+## 8.6 由"能否含不可打印字符"引出的实践推论
+
+1. **`Data.Map` 路径上，base85 编码是多余的** ——
+   value 既然能放原始字节，就别再套一层全可打印编码：
+   **省 25% 体积，也省掉编解码的 CPU**。
+   （KV 文件系统、权重存储这类场景可直接改用原始字节。）
+
+2. **二维表路径上，base85 仍然是正解** ——
+   它的值必须是可打印字符，硬约束改不了。
+   所以**同一份数据走两条路径要两套编码**，别混用。
+
+3. **`Data.Map` 的 Key 建议用 base85 哈希** ——
+   base85 字符集是 `33 + 35~117 + 126`，
+   **不含空格（32）**，天然满足"可打印单字节、排除空格"；
+   32 字节哈希 → base85 约 40 字符 < 50 字节，**安全**。
+
+4. **2MB value ≠ 一次写 2MB** ——
+   KV 有频率限流（`30 + n×10` 次/分），单次塞满 2MB
+   容易触发超时/阻塞。实践上**单次控制在几十 KB 以内**，
+   大数据走分片 + 版本向量（见 KV 文件系统方案）。
+
+5. **导出的表若要导入到别的存档** ——
+   导出侧虽无内存限制，但**导入侧有 500KB + 2000 行**。
+   所以"导出能否再导入"要按导入侧的两条限制来设计分片。
 
 ### 示例
 
@@ -817,7 +944,8 @@ while jb <= lim do
 | ~~`table.concat` 不是函数需自实现~~ | 那是 **lupa 5.5 沙盒**的问题，不是引擎。引擎 table 有 `concat` |
 | ~~导出二维表要分片到多张表~~ | **只用 1 张表，一行放多条** |
 | ~~`Data.Map:GetMapValue`~~ | **真机不存在** |
-| ~~`CloudSever` 可用~~ | 官方标记废弃，走 `Data.Map` |
+| ~~`CloudSever` 可用~~ | **明确废除**，走 `Data.Map`（注意拼写是 Sever） |
+| ~~Studio 版 `CloudService` / `game:GetService` 可用于 UGC 3.0~~ | **Studio 仅适用于 Mini Studio，不适用于 UGC 3.0** |
 | ~~`io`/`package` 有内容~~ | 都是空表 |
 | ~~`os.clock` 可用~~ | **不存在，用了必崩**，一律 `os.timeMs()` |
 
@@ -842,13 +970,14 @@ pairs ipairs select require tostring tonumber next error pcall unpack debug bit 
 - [ ] `loadstring` 到底能不能用（转储=function / 早期实测=nil / 10-18探针=function，三源冲突）
 - [ ] `string` 的 `startswith` / `endswith` / `dump` / `IsBlank` / `Contains` 是否存在
 - [ ] `table` 的 `merge` / `move` / `show` / `num_pairs` / `foreach` / `foreachi` / `maxn` / `tostring` / `getn`
-- [ ] 属性字段 `tips` / `sort` 是否生效
+- [x] ~~属性字段 `tips` / `sort` 是否生效~~ → **✅ 已确认真机生效**（2026-10-18）
+- [x] ~~Studio 版 `CloudService` 能否用于组件脚本~~ → **✅ 已明确不适用于 UGC 3.0**
+- [x] ~~`Data.Map` 数据长度上限~~ → **✅ Key ≤50 字节（可打印单字节、排除空格）；value ≤2MB（可含不可打印字符）**
 - [ ] 1.53 七种"组"类型在脚本侧的确切写法
 - [ ] `DoPeriodicTask` / `DoTaskInTime` 在 1.59.0 各组件类型上的可用性
 - [ ] `AddTriggerEvent` "只在 UI/世界组件有效"的精确边界
-- [ ] Studio 版 `CloudService`（`game:GetService`）能否用于组件脚本
+- [ ] `Data.Array` 单条容量上限的确切数值（已知可用不可打印字符，上限待确认）
 - [ ] `ErrorCode` 完整枚举值
-- [ ] `Data.Map` 数据长度上限的具体数值
 
 ---
 
