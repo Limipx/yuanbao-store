@@ -15,7 +15,7 @@
 -- 开放函数：
 --   ① ScanAll()            扫描全部模块（内置清单 + 运行时 _G 新模块）
 --   ② PrintEvents()        打印 TriggerEvent / ObjectEvent 事件表
---   ③ ExportTable()        导出到二维表（原版不压缩，自动分片）
+--   ③ ExportTable()        导出到二维表（原版不压缩，默认1张表，一行放多条）
 --   ④ DumpLog()            全部结果分块打印到日志
 --   ⑤ DumpCsv()            按 CSV(3列)格式分块打印，可直接存成 .csv
 --   ⑥ DumpModule(模块名)    只打印一个模块
@@ -36,16 +36,29 @@ Script.propertys = {
         type = Mini.String,
         default = "",
         displayName = "输出二维表ID组",
-        tips = "逗号分隔。导出时按每表行数自动分片，表不够会提示还差几张"
+        tips = "逗号分隔。默认只用第1张：导出只有2000行限制、无内存限制，一行可放多条，1张表就够"
     },
+    -- 【限制记忆（用户反复强调，已写死）】
+    --   导入：500KB 内存 + 2000 行
+    --   导出：只有 2000 行上限，【没有】内存限制
+    -- 所以导出一律原版直出：不编码、不压缩、不截断；每表最多 2000 行。
     rowsPerTable = {
         type = Mini.Number,
-        default = 1999,
+        default = 2000,
         displayName = "每表行数",
         minValue = 100,
-        maxValue = 1999,
+        maxValue = 2000,
         format = "%.0f",
-        tips = "二维表本身硬上限2000行(含1行头部)，故最多1999。导出内容无512KB内存限制，所以不压缩不编码，原文直出"
+        tips = "每表最多2000行(含头部，数据1999)。一行放多条后通常1张表即可，不需要分片"
+    },
+    mergeLines = {
+        type = Mini.Number,
+        default = 0,
+        displayName = "每行合并几个成员(0=自动)",
+        minValue = 0,
+        maxValue = 64,
+        format = "%.0f",
+        tips = "0=自动：算出刚好让 1 张表装下全部的行合并数(3840条时=2，约1920行)。导出无内存限制只有2000行限制，所以永远只用1张表。手动填N则每行放N条，分号拼接，纯原文可读，不是编码压缩"
     },
     chunkSize = {
         type = Mini.Number,
@@ -379,8 +392,37 @@ end
 -- 字符串就能用，且读回来 row[1] 就是那个字符串。多传会把行号写进数据表，
 -- 导出后第一列全是 1,2,3...，真正的 API 数据跑到第二列去。
 local MAX_TABLE_ROWS = 2000
+local MAX_DATA_ROWS  = 1999      -- 减去第 1 行头部
 
-local function _writeTable(tid, rows, from, to, hdr, tno, tcnt)
+-- 把若干条记录合并成一行，用 ";" 分隔（纯原文，不是编码/压缩）
+-- 导出无内存限制，只有 2000 行限制 —— 所以一行能放很多，1 张表就够
+local function _packLines(rows, pack)
+    local out = {}
+    local i, n = 1, #rows
+    while i <= n do
+        local t, j = {}, 0
+        while j < pack and i <= n do
+            j = j + 1
+            t[j] = _lineOf(rows[i])
+            i = i + 1
+        end
+        out[#out + 1] = _join(t, ";")
+    end
+    return out
+end
+
+-- pack 自动值：刚好让 1 张表装下全部记录
+local function _autoPack(n)
+    local pack = 1
+    local acc = MAX_DATA_ROWS
+    while acc < n do
+        pack = pack + 1
+        acc = MAX_DATA_ROWS * pack
+    end
+    return pack
+end
+
+local function _writeTable(tid, lines, from, to, hdr)
     if not (Data and Data.Table) then
         return false, "Data.Table 不可用"
     end
@@ -396,7 +438,7 @@ local function _writeTable(tid, rows, from, to, hdr, tno, tcnt)
 
     local n = 0
     for i = from, to do
-        local line = _lineOf(rows[i])
+        local line = lines[i]
         local ok2, err2 = pcall(function()
             Data.Table:InsertValue(tid, nil, line)
         end)
@@ -417,6 +459,10 @@ local function _readBack(tid)
     end)
     if not ok then return nil, "读取失败: " .. _s(err) end
     if type(all) ~= "table" then return nil, "GetAllValue 返回的不是表" end
+    local hdr = ""
+    if type(all[1]) == "table" and type(all[1][1]) == "string" then
+        hdr = all[1][1]
+    end
     local out = {}
     for i = 2, #all do          -- 跳过第 1 行头部
         local row = all[i]
@@ -424,7 +470,7 @@ local function _readBack(tid)
             out[#out + 1] = row[1]
         end
     end
-    return out
+    return out, hdr
 end
 
 --======================== 组件启动 ========================
@@ -500,39 +546,57 @@ function Script:ExportTable()
     if #real == 0 then
         return "ERR: 属性[输出二维表ID组]为空，先填表ID（逗号分隔）"
     end
+    -- 【铁律】导出只有 2000 行限制，没有内存限制。
+    -- 所以：一行可以放很多条，1 张表就装得下全部，根本不需要分片。
+    local n = #_rows
+    if n == 0 then return "ERR: 扫描结果为 0 行，先点 ①扫描全部模块" end
+
+    local mrg = self.mergeLines
+    if type(mrg) ~= "number" or mrg < 1 then mrg = 0 end
+    local pack = (mrg >= 1) and mrg or _autoPack(n)
+
+    local lines = _packLines(_rows, pack)
+
     local per = self.rowsPerTable or 1999
     if type(per) ~= "number" or per < 1 then per = 1999 end
-    -- 每张表硬上限 2000 行（含头部），数据行最多 1999
-    if per > MAX_TABLE_ROWS - 1 then per = MAX_TABLE_ROWS - 1 end
+    if per > MAX_DATA_ROWS then per = MAX_DATA_ROWS end
     -- 纯加法算需要几张表，不依赖 math.ceil/math.floor
     local need = 1
     local acc = per
-    while acc < #_rows do
+    while acc < #lines do
         need = need + 1
         acc = acc + per
     end
     if need > #real then
-        return "ERR: 表不够。共 " .. #_rows .. " 行，每表 " .. per
-            .. " 行，需要 " .. need .. " 张，只填了 " .. #real .. " 张（还差 " .. (need - #real) .. " 张）"
+        return "ERR: 表不够。合并后 " .. #lines .. " 行，每表 " .. per
+            .. " 行，需要 " .. need .. " 张，只填了 " .. #real
+            .. " 张（还差 " .. (need - #real) .. " 张）。"
+            .. "把[每行合并几个成员]调大就能只用 1 张表（导出无内存限制）"
     end
+
     local out = {}
+    local bytes = 0
     for t = 1, need do
         local from = (t - 1) * per + 1
         local to = t * per
-        if to > #_rows then to = #_rows end
+        if to > #lines then to = #lines end
+        for i = from, to do bytes = bytes + #lines[i] + 1 end
         local hdr = string.format(
-            "APIP1|V1|TI:%d|TC:%d|DR:%d|FROM:%d|TO:%d|MOD:%d|NEW:%d|TIME:%s|LEN:%d",
-            t, need, to - from + 1, from, to, _stat.modOk, _stat.newMod,
-            _s(os.time and os.time() or 0), #_rows)
-        local ok, n = _writeTable(real[t], _rows, from, to, hdr, t, need)
+            "APIP2|V2|PK:%d|TI:%d|TC:%d|DL:%d|DR:%d|FROM:%d|TO:%d|MOD:%d|NEW:%d|TIME:%s|LEN:%d",
+            pack, t, need, #lines, to - from + 1, from, to,
+            _stat.modOk, _stat.newMod,
+            _s(os.time and os.time() or 0), n)
+        local ok, w = _writeTable(real[t], lines, from, to, hdr)
         if ok then
-            out[#out + 1] = "表" .. t .. "(" .. real[t] .. ") 写入 " .. n .. " 行"
+            out[#out + 1] = "表" .. t .. "(" .. real[t] .. ") 写入 " .. w .. " 行"
         else
-            out[#out + 1] = "表" .. t .. " 失败: " .. _s(n)
+            out[#out + 1] = "表" .. t .. " 失败: " .. _s(w)
         end
     end
-    return "导出完成（原版不压缩），共 " .. #_rows .. " 行 / " .. need .. " 张表。 "
-        .. _join(out, " | ") .. " 。接着点 ⑩校验导出 读回来比对"
+    return "导出完成（原版不压缩，一行放 " .. pack .. " 条，分号分隔）。"
+        .. " 记录 " .. n .. " 条 → " .. #lines .. " 行 → " .. need .. " 张表，约 "
+        .. bytes .. " 字节。 " .. _join(out, " | ")
+        .. " 。（导入侧才有 500KB 限制，导出没有）接着点 ⑩校验导出 读回来比对"
 end
 
 function Script:Verify()
@@ -546,33 +610,58 @@ function Script:Verify()
         if v ~= "" then real[#real + 1] = v end
     end
     if #real == 0 then return "ERR: 属性[输出二维表ID组]为空" end
+
+    local n = #_rows
+    local mrg = self.mergeLines
+    if type(mrg) ~= "number" or mrg < 1 then mrg = 0 end
+    local pack = (mrg >= 1) and mrg or _autoPack(n)
+    local lines = _packLines(_rows, pack)
+
     local per = self.rowsPerTable or 1999
-    if per > MAX_TABLE_ROWS - 1 then per = MAX_TABLE_ROWS - 1 end
+    if type(per) ~= "number" or per < 1 then per = 1999 end
+    if per > MAX_DATA_ROWS then per = MAX_DATA_ROWS end
 
     local got, bad, first = 0, 0, ""
+    local readRows = 0
     for t = 1, #real do
-        local arr, err = _readBack(real[t])
+        local arr, err, hdr = _readBack(real[t])
         if not arr then
             return "表" .. t .. "(" .. real[t] .. ") " .. _s(err)
         end
+        -- 头部里带了实际合并数 PK，以它为准
+        if type(hdr) == "string" then
+            local pk = hdr:match("PK:(%d+)")
+            if pk then
+                local v = tonumber(pk)
+                if v and v >= 1 and v ~= pack then
+                    pack = v
+                    lines = _packLines(_rows, pack)
+                end
+            end
+        end
         local from = (t - 1) * per + 1
-        if from > #_rows then break end
+        if from > #lines then break end
         for i = 1, #arr do
-            local want = _lineOf(_rows[from + i - 1])
-            if arr[i] == want then
+            readRows = readRows + 1
+            local want = lines[from + i - 1]
+            if want ~= nil and arr[i] == want then
                 got = got + 1
             else
                 bad = bad + 1
                 if first == "" then
-                    first = "第" .. (from + i - 1) .. "行 期望[" .. want
-                        .. "] 实读[" .. arr[i] .. "]"
+                    first = "表" .. t .. "第" .. i .. "行 期望["
+                        .. _s(want) .. "] 实读[" .. _s(arr[i]) .. "]"
                 end
             end
         end
     end
+    if readRows == 0 then
+        return "★校验无效：一张表都没读回内容（表ID填错？或 GetAllValue 返回结构不是 {[1]=字符串}）。"
+            .. " 表内行数请用 ⑩ 之前的 ③ 输出核对"
+    end
     if bad == 0 then
-        return "校验通过：读回 " .. got .. " 行，与内存中的 " .. #_rows
-            .. " 行逐行一致（差 " .. (#_rows - got) .. " 行可能超表未写）"
+        return "校验通过：读回 " .. readRows .. " 行 × 每行" .. pack
+            .. "条 = 覆盖 " .. n .. " 条记录，与内存中逐条一致（0 不一致）"
     end
     return "★校验失败：一致 " .. got .. " 行，不一致 " .. bad .. " 行。首个：" .. first
 end
