@@ -22,8 +22,10 @@
 --   ⑦ Lookup(关键字)        按关键字查成员（模块名或成员名模糊匹配）
 --   ⑧ Diff()               与内置转储清单对照：缺失 / 新增
 --   ⑨ SelfCheck()          自检
+--   ⑩ Verify()             读回二维表，逐行比对，证明导出真的落进去了
 --
--- 依赖：Data.Table:Clear / InsertValue（写二维表）
+-- 依赖：Data.Table:Clear / InsertValue / GetAllValue
+--       签名以 建筑文件生成器3.1 实机写法为准，不许照转储猜（转储里是变参...）
 --       os.timeMs（计时，不用 os.clock，引擎没有）
 --====================================================================
 local Script = {}
@@ -38,12 +40,12 @@ Script.propertys = {
     },
     rowsPerTable = {
         type = Mini.Number,
-        default = 1800,
+        default = 1999,
         displayName = "每表行数",
         minValue = 100,
-        maxValue = 100000,
+        maxValue = 1999,
         format = "%.0f",
-        tips = "二维表导出无内存限制，可按需要调大"
+        tips = "二维表本身硬上限2000行(含1行头部)，故最多1999。导出内容无512KB内存限制，所以不压缩不编码，原文直出"
     },
     chunkSize = {
         type = Mini.Number,
@@ -119,6 +121,11 @@ Script.openFnArgs = {
     SelfCheck = {
         returnType = Mini.String,
         displayName = "⑨自检",
+        params = {}
+    },
+    Verify = {
+        returnType = Mini.String,
+        displayName = "⑩校验导出(读回比对)",
         params = {}
     }
 }
@@ -363,27 +370,61 @@ end
 
 --======================== 写二维表 ========================
 
-local function _writeTable(tid, rows, from, to)
+-- 写二维表。
+-- 【签名以 建筑文件生成器3.1 实测为准，不猜】
+--   Data.Table:Clear(tableId, nil)
+--   Data.Table:InsertValue(tableId, nil, 一个字符串)   ← 每行只传一个字符串
+--   Data.Table:GetAllValue(tableId, nil) -> { {[1]=字符串}, ... }  第1行是头部
+-- 转储里 InsertValue 是 (self,varId,playerId,...)，变参；但 3.1 实机只传一个
+-- 字符串就能用，且读回来 row[1] 就是那个字符串。多传会把行号写进数据表，
+-- 导出后第一列全是 1,2,3...，真正的 API 数据跑到第二列去。
+local MAX_TABLE_ROWS = 2000
+
+local function _writeTable(tid, rows, from, to, hdr, tno, tcnt)
     if not (Data and Data.Table) then
         return false, "Data.Table 不可用"
     end
-    local ok = pcall(function() Data.Table:Clear(tid, nil) end)
-    if not ok then
-        -- 清不掉也继续写，不致命
+    pcall(function() Data.Table:Clear(tid, nil) end)
+
+    -- 头部行（与 3.1 同一套路：第 1 行放元信息，读的时候跳过）
+    local okh, errh = pcall(function()
+        Data.Table:InsertValue(tid, nil, hdr)
+    end)
+    if not okh then
+        return false, "写头部失败: " .. _s(errh)
     end
+
     local n = 0
     for i = from, to do
-        local r = rows[i]
+        local line = _lineOf(rows[i])
         local ok2, err2 = pcall(function()
-            Data.Table:InsertValue(tid, nil, i - from + 1, _lineOf(r), "")
+            Data.Table:InsertValue(tid, nil, line)
         end)
         if ok2 then
             n = n + 1
         else
-            return false, _s(err2)
+            return false, "第 " .. i .. " 行失败: " .. _s(err2)
         end
     end
     return true, n
+end
+
+-- 读回二维表，校验导出是否真的落进去了
+local function _readBack(tid)
+    local all
+    local ok, err = pcall(function()
+        all = Data.Table:GetAllValue(tid, nil)
+    end)
+    if not ok then return nil, "读取失败: " .. _s(err) end
+    if type(all) ~= "table" then return nil, "GetAllValue 返回的不是表" end
+    local out = {}
+    for i = 2, #all do          -- 跳过第 1 行头部
+        local row = all[i]
+        if type(row) == "table" and type(row[1]) == "string" then
+            out[#out + 1] = row[1]
+        end
+    end
+    return out
 end
 
 --======================== 组件启动 ========================
@@ -459,8 +500,10 @@ function Script:ExportTable()
     if #real == 0 then
         return "ERR: 属性[输出二维表ID组]为空，先填表ID（逗号分隔）"
     end
-    local per = self.rowsPerTable or 1800
-    if type(per) ~= "number" or per < 1 then per = 1800 end
+    local per = self.rowsPerTable or 1999
+    if type(per) ~= "number" or per < 1 then per = 1999 end
+    -- 每张表硬上限 2000 行（含头部），数据行最多 1999
+    if per > MAX_TABLE_ROWS - 1 then per = MAX_TABLE_ROWS - 1 end
     -- 纯加法算需要几张表，不依赖 math.ceil/math.floor
     local need = 1
     local acc = per
@@ -477,7 +520,11 @@ function Script:ExportTable()
         local from = (t - 1) * per + 1
         local to = t * per
         if to > #_rows then to = #_rows end
-        local ok, n = _writeTable(real[t], _rows, from, to)
+        local hdr = string.format(
+            "APIP1|V1|TI:%d|TC:%d|DR:%d|FROM:%d|TO:%d|MOD:%d|NEW:%d|TIME:%s|LEN:%d",
+            t, need, to - from + 1, from, to, _stat.modOk, _stat.newMod,
+            _s(os.time and os.time() or 0), #_rows)
+        local ok, n = _writeTable(real[t], _rows, from, to, hdr, t, need)
         if ok then
             out[#out + 1] = "表" .. t .. "(" .. real[t] .. ") 写入 " .. n .. " 行"
         else
@@ -485,7 +532,49 @@ function Script:ExportTable()
         end
     end
     return "导出完成（原版不压缩），共 " .. #_rows .. " 行 / " .. need .. " 张表。 "
-        .. _join(out, " | ")
+        .. _join(out, " | ") .. " 。接着点 ⑩校验导出 读回来比对"
+end
+
+function Script:Verify()
+    if not _done then
+        return "ERR: 先点 ①扫描全部模块"
+    end
+    local ids = _sp(self.outTableIds or "", ",")
+    local real = {}
+    for i = 1, #ids do
+        local v = (ids[i] or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        if v ~= "" then real[#real + 1] = v end
+    end
+    if #real == 0 then return "ERR: 属性[输出二维表ID组]为空" end
+    local per = self.rowsPerTable or 1999
+    if per > MAX_TABLE_ROWS - 1 then per = MAX_TABLE_ROWS - 1 end
+
+    local got, bad, first = 0, 0, ""
+    for t = 1, #real do
+        local arr, err = _readBack(real[t])
+        if not arr then
+            return "表" .. t .. "(" .. real[t] .. ") " .. _s(err)
+        end
+        local from = (t - 1) * per + 1
+        if from > #_rows then break end
+        for i = 1, #arr do
+            local want = _lineOf(_rows[from + i - 1])
+            if arr[i] == want then
+                got = got + 1
+            else
+                bad = bad + 1
+                if first == "" then
+                    first = "第" .. (from + i - 1) .. "行 期望[" .. want
+                        .. "] 实读[" .. arr[i] .. "]"
+                end
+            end
+        end
+    end
+    if bad == 0 then
+        return "校验通过：读回 " .. got .. " 行，与内存中的 " .. #_rows
+            .. " 行逐行一致（差 " .. (#_rows - got) .. " 行可能超表未写）"
+    end
+    return "★校验失败：一致 " .. got .. " 行，不一致 " .. bad .. " 行。首个：" .. first
 end
 
 function Script:DumpLog()

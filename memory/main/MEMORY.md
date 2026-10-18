@@ -614,7 +614,30 @@ mock 必须全程保持 32 位无符号，仅出口 `tobit` 转有符号。
   2,"值",
   ```
   3 列：行号 / 引号包裹的值 / 空。前 3 行元数据。多字段用 `|` 拼在值里。
-- 每表行数按需分片（默认 1800），**表不够要明确报"还差几张"**，不要静默截断。
+- 每表行数按需分片（默认 1999，硬上限 2000 含头部），**表不够要明确报"还差几张"**，不要静默截断。
+
+## ⛔ 二维表 Data.Table 实机签名（以 建筑文件生成器3.1 为准，禁止照转储猜）
+
+转储写的是 `InsertValue(self, varId, playerId, ...)` 变参，**照它猜会写错位**。
+实机可用写法（3.1 里跑通的那套）：
+
+```lua
+Data.Table:Clear(tableId, nil)
+Data.Table:InsertValue(tableId, nil, 一个字符串)   -- 每行只传【一个】字符串
+local all = Data.Table:GetAllValue(tableId, nil)    -- {{[1]=字符串},...} 第1行是头部
+```
+
+- 传了第 4、5 个参数（行号、空串）时：行号变成第 1 列的值，真正数据跑到第 2 列
+  → 导出 CSV 第一列全是 1,2,3...，**静默错位不报错**。
+- 第 1 行放头部（如 `BLD3|V1|DR:n|...`），读的时候 `for i=2,#all` 跳过。
+- 每张表硬上限 **2000 行**（含头部 → 数据最多 1999）。这不是内存限制，是表本身限制。
+- 每行字符数可到 500+（真机 mmlm_1.csv 是 945 行 × 500 字符）。
+- 其余成员：GetValue / SetValue / GetCols / GetRowIndex / InsertValueByRow /
+  UpdateAllValue / UpdateLineValues / RemoveRow / GetTableColKeys。
+
+**2026-10-18 我犯的错**：API 全模块探针 v1 写成
+`InsertValue(tid, nil, i-from+1, line, "")` 5 个参数，还自称"导出 3827 行零丢行"
+（其实是在 mock 里跑的，不是真机）。已修为单字符串 + 头部行 + 新增 ⑩Verify 读回比对。
 
 ## 引擎环境硬事实（2026-10-18 真机探针 + 用户早期探测文档）
 
