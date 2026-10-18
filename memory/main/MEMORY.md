@@ -910,3 +910,32 @@ os          date / time / timeMs（无 clock，用了必崩）
 - ~~Data.Map:GetMapValue~~（真机不存在）
 - **`Lua5.1数学库缺失与实测坑.md` 整体废除**（前提就是错的）
 
+
+
+---
+
+## ★★ Data.Map:UpdateValueAndCallback = 服务端原子 RMW（2026-10-18 官方文档实证）
+
+**这是 KV 并发正确性的支点，之前一直不知道，导致 v3 用 Get+Set 必然丢更新。**
+
+- 签名：`Data.Map:UpdateValueAndCallback(varId, playerId, key, callback) -> bool`
+  **只有 4 参，没有 value**（文档三那版带 value 的是玩家封装，不是官方签名）
+- 语义：服务端托管 CAS + 自动重试。
+  `GET(code=KV_UPDATE_GET)` → `SET(code=KV_UPDATE_SET, return 新值)` → 冲突则重新 GET/SET → `OK`
+- 官方原话："确保数据不出错，不会被其他玩家覆盖"
+
+**铁律（写进任何 KV 并发代码前必须记住）**
+1. 合并函数**必须是 join**（幂等+交换+结合）—— 重试时 base 每次都变，非幂等会重复累加
+2. 回调会被调多次，不能用调用次数做业务计数
+3. SET 与 OK 可能同值（官方博客"首次调用 ret 必然为 0"），
+   必须用"值==刚返回的新值"或调用序号兜底
+4. 重试耗尽 → 直接 set 最后合并结果仍是安全的（join 保证已见内容都在里面）
+
+**其他本轮确认**
+- 全图共享配额 `30 + 在线×10` 次/分 → 人均预算 ≈ 10 次/分
+  铁律：`maxTrackSites × 60/autoSyncSec ≤ 10`
+- 稳态同步优化：指针 seq 未变就一个字节都不多读（50 站点稳态 166 读 → 50 读）
+- dot 唯一性**不能靠 siteId**（同 uin 双开必然同 id），要用 **seq 块预留**：
+  向 `Q.<app>.<site>` 原子申领 64 个连续 seq，区间不重叠
+- 构造远程 op 做冲突测试时，HLC 必须取"未来"值，否则排在 mk 之前被复活，
+  导致并发冲突根本检不出（v4 Check ⑲踩过）

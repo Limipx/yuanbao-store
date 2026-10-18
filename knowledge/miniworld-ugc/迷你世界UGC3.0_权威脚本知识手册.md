@@ -753,6 +753,43 @@ GetNumValuesAndCallback / GetRangeValuesAndCallback  排行榜专用
 SetRankValueAndBlock / ClearData
 ```
 
+
+### ★★ UpdateValueAndCallback 是【服务端原子读-改-写】（最重要的一个接口）
+
+官方文档原话："安全更新表中某个 key 下的值，并发存取数据，确保 Key 下的值唯一性"；
+"遇到冲突、失败的情况，接口会自动回传最新的数据值，并调用开发者的回调函数…
+确保了数据不出错，不会被其他玩家覆盖"。
+
+**签名**：`Data.Map:UpdateValueAndCallback(varId, playerId, key, callback) -> bool`
+（**只有 4 个参数，没有 value 参数** —— 文档三里那个带 value 的版本是玩家封装，不是官方签名）
+
+**回调协议**：
+
+| 阶段 | code | 你应该做什么 |
+|---|---|---|
+| 引擎交付当前值 | `ErrorCode.KV_UPDATE_GET` | 记录 `value` |
+| 引擎索要新值 | `ErrorCode.KV_UPDATE_SET` | **return 新值**（字符串，建议 `json.encode`） |
+| 写回冲突 | 重新 GET 再 SET | 你的回调会被**再次调用**，必须能重算 |
+| 成功 | `ErrorCode.OK` | 完成 |
+
+等价于数据库 `UPDATE ... WHERE version = x` 的自动重试循环 = 乐观锁，**重试由服务端驱动**。
+
+**⚠ 三条硬纪律**
+
+1. **合并函数必须是 join（幂等+交换+结合）**。因为重试时 base 每次都可能不同，
+   `old+1` 这类非幂等操作重试一次就多算一次。**只有 join 抗重试。**
+2. **回调可能被调多次**，不要用回调次数做业务计数。
+3. **枚举值不确定**：实测存在 `KV_UPDATE_SET` / `KV_UPDATE_GET` / `OK` 三个码，
+   但官方博客说"首次调用 ret 必然为 0"，即 SET 与 OK 可能同值。
+   → 必须用"值是否等于刚返回的新值"或"调用序号"做兜底区分，**不能只比对枚举**。
+
+**降级路径**：若该接口不存在或投递失败，退回 `GetValueAndBlock` → 合并 → `SetValueAndBlock`，
+并在写前重读校验（尽力 CAS），重试 8 次。合并函数是 join 时，最终直接 `set` 也不丢已见数据。
+
+**ErrorCode 完整枚举**（官方 global.html）：
+`OK`(成功) `FAILED` `KV_UPDATE_GET` `KV_UPDATE_SET` `KV_OP_CD_LMT`(CD超限)
+`KV_OP_QPM_LMT`(QPM超限) `KV_OP_NO_VAL`(key不存在) `KV_OP_INVALID_VAL`(类型不匹配)
+
 **入参**：`varId`(string) `playerId`(number|nil 全局传 nil) `key`(string) `value`(string|number|boolean) `callback`(function)
 **返回**：`code`(ErrorCode) `key` `value` [排行榜额外：`index` `ascending` `extendinfo`]
 
