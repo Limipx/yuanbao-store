@@ -305,12 +305,31 @@ a, b = string.find(s, "%s+$")
 if a then s = string.sub(s, 1, a - 1) end
 return s
 end
--- 32 位 FNV-1a（纯算术，255 * 2^32 < 2^53，double 精度安全）
+-- ★ 位运算一律用引擎原生 bit（12 成员齐全：band/bor/bxor/bnot/bswap/lshift/
+--   rshift/arshift/rol/ror/tobit/tohex），禁止任何"自拼兜底"。
+local _bit    = bit
+local _bxor   = _bit.bxor
+local _band   = _bit.band
+local _rshift = _bit.rshift
+local _tobit  = _bit.tobit
+
+-- 32 位 FNV-1a（真·先异或后乘）
+-- ★ 修正 v4 初版的两处错误：
+--   1) 旧码写成 "先乘后加" —— 那既不是 FNV-1 也不是 FNV-1a
+--      （FNV-1 是先乘后异或，FNV-1a 是先异或后乘）
+--   2) 旧注释称 "255 * 2^32 < 2^53 安全"，但真正的瓶颈是 h * 16777619 ≈ 2^56，
+--      远大于 2^53 => double 直接丢精度。实测 7/7 输入全部算错，
+--      且长公共前缀键（如 D.app.xxxx.yyyy）分桶卡方 1120（临界值 30）。
+-- 乘法拆高低 16 位：中间量恒 < 2^41 << 2^53，double 完全精确。
+local FNV_P = 16777619
 local function _h32(s)
 local h = 2166136261
 for i = 1, #s do
-h = (h * 16777619) % 4294967296
-h = (h + string.byte(s, i)) % 4294967296
+local x = _bxor(_tobit(h), string.byte(s, i))
+if x < 0 then x = x + 4294967296 end      -- 有符号 -> 无符号
+local hi = math.floor(x / 65536)
+local lo = x - hi * 65536
+h = (((hi * FNV_P) % 65536) * 65536 + lo * FNV_P) % 4294967296
 end
 return h
 end
@@ -318,8 +337,8 @@ local HEX = "0123456789abcdef"
 local function _hex8(n)
 local s = ""
 for i = 7, 0, -1 do
-local b = math.floor(n / math.pow(2, i * 4)) % 16
-s = s .. string.sub(HEX, b + 1, b + 1)
+local b = _band(_rshift(n, i * 4), 15) + 1
+s = s .. string.sub(HEX, b, b)
 end
 return s
 end
@@ -1559,6 +1578,15 @@ self._forceSync = true   -- 自检一律走同步路径，保证可断言
 self:_ensureSite()
 ck("①站点ID非空且<=12字符", self._site and #self._site > 0 and #self._site <= 12, self._site)
 ck("②_hash 稳定", _hash("abc") == _hash("abc") and _hash("abc") ~= _hash("abd"))
+ck("②b bit 模块齐全(原生,无兜底)", type(_bit) == "table"
+and type(_bxor) == "function" and type(_band) == "function"
+and type(_rshift) == "function" and type(_tobit) == "function", type(_bit))
+-- FNV-1a 标准值（与 Python 独立实现逐一核对）
+ck("②c _h32 符合 FNV-1a 标准值", _h32("") == 2166136261
+and _h32("a") == 3826002220 and _h32("abc") == 440920331
+and _h32("foobar") == 3214735720, _h32("abc"))
+ck("②d _hex8 边界(含 0xffffffff)", _hex8(0) == "00000000"
+and _hex8(4294967295) == "ffffffff" and #_hex8(_h32("x")) == 8, _hex8(4294967295))
 ck("③_ordkey 定长", #_ordkey("1700000000000:5", "S1.1") == 13 + 1 + 5 + 1 + 4)
 -- 合并是 join
 local a1 = _mergeReg("", { { site = "S1", shard = 2, seq = 5 } })
