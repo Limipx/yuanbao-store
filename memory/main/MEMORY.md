@@ -1010,3 +1010,61 @@ os          date / time / timeMs（无 clock，用了必崩）
 ⛔ **文件里不写明文 PAT** —— GitHub secret scanning 会返回
 `409 Repository rule violations found / Secret detected in content`，提交被拒。
 PAT 一律由用户在会话开头提供，文件里只写占位符。
+
+
+## 迷你世界 特效编辑器（1.51.0 新增，2025-10-30）
+
+### 官方事实
+- 1.51.0 上线：自定义特效，**多节点**（根下挂多套粒子系统），**100+ 粒子参数**，触发器/脚本调用
+- 入口：创作工具3.0 → 资源库 → 特效 → 新建；沙盒工坊有"特效尝鲜包"可直接导入
+- 自定义贴图三步：上传图片 → 新建【特效材质】替换贴图 → 特效的【渲染】模块里选该材质
+- 面板模块列表：渲染 / 发射器 / 发射器形状 / 噪声 / 序列帧 / 拖尾（拖尾等需勾选才展开）
+
+### 权威字段（官方 EffectObject，Unity 粒子系统风格）
+Duration 持续时间 · Looping 循环 · Prewarm 预启动(仅循环生效) · StartDelay 延迟
+StartLifetime 存在时间 · StartSpeed 初始速度 · StartSize 初始缩放 · StartRotation 初始旋转
+StartColor/StartColorGradient 初始颜色 · GravityModifier 重力乘数(0无重力/正下落/负上浮)
+RateOverTime 发射速率 · MaxParticles 最大粒子数量 · Shape 发射器形状
+SimulationSpeed 播放速度 · SimulationSpace 移动坐标系(局部=跟随/世界=留原地)
+ScalingMode 缩放模式 · AutoRandomSeed/RandomSeed · PlayOnAwake · AutoDestory
+TrailsMode/TrailsTextureMode/WidthOverTrails/ColorOverTrails/TrailsTexturePath/SizeAffectsWidth
+ColorOverLifeTimeMode + Min/MaxColor · VelocityOverLifeTimeLinear(含轨道速度)
+ParticleEmissionBurst Brust(Time/Count/Cycles/Interval) · CullingMode · RingBufferMode
+
+### ⛔ 纠正：不要把网易《我的世界》参数混进来
+emissionrate / activetime / inactivetime / numparticles / emitterpath 是**网易 MC Studio**的字段名，
+迷你世界用 Unity 风格命名（见上）。此前整理文档标注"来源迷你世界官方Wiki"是错的。
+
+### 4 种数值模式 + 4 种颜色模式
+常量 / 两个常量间随机 / 曲线(按发射器时间采样) / 两个曲线间随机
+颜色 / 两颜色随机 / 颜色梯度 / 两颜色梯度随机
+两套曲线都存在：【曲线】按发射器时间，【随XXX变化】按粒子生命。别只记一套。
+
+### 播放（官方签名 6 参）
+World:playParticalEffect(x, y, z, particleId, scale, ptime, bUsePlayerViewRange)
+  ptime>0 循环播放到时间结束；填0只播一次
+Backpack:PlayShortCutItemParticle(playerid, itemid, effectid) / PlayShortCutIxEffect / StopShortCutItemEffect
+特效事件：TriggerEvent.ParticlePosOnCreate / PlayerOnCreate / MobOnCreate / ObjectOnCreate /
+          ItemOnCreate / ProjectileOnCreate / EntityOnCreate（传 eventobjid,x,y,z,effectid）
+⚠ 循环特效不会自己消失，需触发器"删除位置上的特效"
+
+### 面板实证要点
+- 半球体/圆环/圆形默认朝侧面 → 旋转 X 改 -90 才平铺
+- 半径厚度=0 → 粒子严格同球面（整齐）；留厚度 → 分散（自然）
+- 拖尾：长度 星轨0.03/人物0.08~0.15/刀光0.02；宽度 4~10，刀光 15~30
+- 序列帧：水平/垂直分段要与实际贴图一致，非序列图填 0
+- 渲染模式 广告版(面向摄像机) / 水平面(贴地)；想更亮用"叠加"混合
+
+### 性能红线
+同屏数 = 发射速率 × 存在时间，必须 ≤ 最大粒子数量
+手机端单特效 ≤300，全屏合计 ≤800，中低端保守 ≤150
+卡顿顺序：砍最大粒子数量 → 砍发射速率 → 缩短存在时间 → 关噪声 → 关拖尾 → 关序列帧
+
+### 已知限制
+没有"脚本写入特效资源"的接口，脚本只能播放已做好的特效，参数必须在面板里点。
+
+## ⛔ 教训：长字符串闭合写反会吞掉整段（2026-10-20）
+写 `[==[ ... ]==]` 时把闭合写成 `==])`，语法上不报错，但会把后续内容吞进字符串
+直到下一个 `]==]` 才闭合 —— 结果整个数据项静默消失。
+本次吞掉了排查库的"粒子不跟随"整项，自检才发现（排查项 8 项变 7 项）。
+**做法：写完立刻 `grep -c '\[==\['` 与 `grep -c '\]==\]'` 比对数量必须相等。**
