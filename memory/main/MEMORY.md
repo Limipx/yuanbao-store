@@ -997,3 +997,16 @@ os          date / time / timeMs（无 clock，用了必崩）
   会让 `type(bit.ror)=="function"` 这类自检假失败。要把它们包成 Lua 闭包再放进 bit 表。
 - **二进制（Pack 结果）不能经 Python 往返**，Pack→Unpack 必须在 Lua 内一次完成
   （用 `raw()` 执行整段 Lua 代码）。
+
+## ★ 跨会话恢复卡（2026-10-19 新建）
+
+**文件**：`knowledge/miniworld-ugc/跨会话恢复_迷你UGC3.0.md`（806 行 / 37.2KB，已上传 GitHub）
+
+新会话开局**只读这一份**即可恢复全部已验证知识，不必再翻 26 篇零散文档。
+16 章：恢复步骤 / 环境硬事实 / 组件表规范 / 属性系统 / Trigger 事件体系 /
+广播通信 / 数据存储 / 并发与云服 / 性能判据 / 静默失效清单(20条) /
+已废除知识 / 交付纪律 / 待验证清单 / 沙盒测试环境 / 资产清单 / 上次会话状态。
+
+⛔ **文件里不写明文 PAT** —— GitHub secret scanning 会返回
+`409 Repository rule violations found / Secret detected in content`，提交被拒。
+PAT 一律由用户在会话开头提供，文件里只写占位符。
