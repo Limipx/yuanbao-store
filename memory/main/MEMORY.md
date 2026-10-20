@@ -1068,3 +1068,50 @@ Backpack:PlayShortCutItemParticle(playerid, itemid, effectid) / PlayShortCutIxEf
 直到下一个 `]==]` 才闭合 —— 结果整个数据项静默消失。
 本次吞掉了排查库的"粒子不跟随"整项，自检才发现（排查项 8 项变 7 项）。
 **做法：写完立刻 `grep -c '\[==\['` 与 `grep -c '\]==\]'` 比对数量必须相等。**
+
+
+---
+
+## 五子棋·元件界面版（2026-10-20 实测，Lua 5.1 / lupa）
+
+产物：`五子棋_元件版.lua`（47670字节，md5 daafbac6）+ 同名 .txt + 说明.md
+自检 12/12；功能断言全过（匹配/段位幂等/跨房间同步/观战/AI对局）。
+
+### ⛔ 本轮踩到的硬错误（全是"不报错/编译期"类型）
+
+1. **Lua 5.1 闭包内不能直接用 `...`** —— 编译期就失败：
+   `cannot use '...' outside a vararg function`。
+   必须先 `local a = { ... }`，再 `unpack(a)`。
+   （我写在 `pcall(function() self:PushCustomEvent(self.evtId, ...) end)` 里，直接编译不过。）
+2. **分值数组索引从 1 起**：`local VAL = {0,10,120,...}` 的 `VAL[0]` 是 nil。
+   棋型等级是 0..7，必须写 `{ [0] = 0, 10, 120, ... }`。
+   否则症状是 `attempt to perform arithmetic on field '?'`（field '?' = 表索引为变量）。
+3. **`local function _buildMenu(self, s)` 不能当方法调** —— `self:_buildMenu(s)` = nil。
+   要统一成 `function Gomoku:_buildMenu(s)`（下划线开头不会被当开放函数）。
+4. **运行时状态别挂组件表**：`self.sessions = {}` 会让非函数字段超标
+   （白名单只有 propertys/openFnArgs）。改挂模块 local `SESSIONS = {}`。
+   ⚠️ 属性字段（self.uiId 等）是引擎注入的，不算我定义的，实测计数里会多出来，属正常。
+
+### 架构要点
+
+- **跨房间同步必须双通道**：`PushCustomEvent`(房间广播) **只在房内有效**；
+  跨房间靠 `Data.Map` 轮询（每 3 秒读棋局快照）兜底。
+  实测：丢弃全部广播后，对手仍通过轮询收到落子。
+  （Data.Map 的 playerId=nil 跨房间共享同一 varId，这是前提。）
+- **段位幂等**：value 存 `分|胜|负|已结算matchId列表`，用 matchId 去重
+  → 重复结算只加一次（实测第二次返回 false，积分保持 30）。
+- **AI = TSS（威胁空间搜索）**：VCF(连续冲四,深度12) + VCT(冲四活三浅搜) +
+  双威胁(双四/四三/双三) + 评估选点。棋型用 9 格窗口字符串模式匹配。
+- **AI 性能**：候选按"紧邻棋子数"排序截断（limit 32~48）+ 预算
+  `_budget = 1500 + level*1500` → 84 手对局从 29.5s 降到 2.6s（**11 倍**），每手 0.03s。
+- **无禁手先手必胜是数学事实**（Allis 1993/94 证明），**执白无法保证必胜**。
+  AI 无论先后手跑同一套 TSS：执黑寻杀，执白先守、抓失误反杀。
+  实测对纯随机：执黑 8/8、执白 8/8。
+
+### 测试台（lupa 2.8，与旧记忆不同）
+
+- 入口是 `from lupa import lua51; lua = lua51.LuaRuntime()`，**不是** `lupa.lua51()`，
+  也不是 `lupa.LuaRuntime()`（那是最新版 Lua，不是 5.1）。
+- 源码传入：`lua.globals().CODE = src`，再用 `loadstring(CODE)` 走 chunk 顶层
+  （这样能测顶层 local 上限；`lua.execute("CODE = ...")` 拿不到参数，CODE 为 nil）。
+- mock 要补 `bit`（12 成员）和 `os.timeMs`，否则自检里这两项会假失败。
