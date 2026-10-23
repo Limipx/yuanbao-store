@@ -1208,3 +1208,30 @@ table 扩展 9 + 全局 unpack / 全局函数 14（pcall/select/setmetatable…�
 ### 未处理（非功能性）
 244 个老积木 `params_desc` 数量与占位符数不一致 —— 只影响 UI 参数标签显示，
 不影响生成代码（源码取不到就用空标签）。
+
+## Blockly编辑器 v3 轮次（继续修到无问题）
+
+### 检测方法（有效，沿用）
+- 用 Node 解析 `B/G/L/X/DATA_MAP` 常量真成对象再逐条过（单常量最长26万字符，必须程序化）
+- 模板逐个用 lupa 的 `load()` 编译（沙盒只有 Lua5.4/5.5，无 5.1；故另配 5.1 不兼容语法扫描）
+
+### ⛔ 审计规则本身的坑（我第一轮误报 241 条）
+- **事件积木（`is_event:true`）的 `params_desc` 是"事件传参文档"，不是输入标签** —— 它走 `msg0/msg1` 自定义消息，params_desc 不参与 UI 标签。只有**非事件、非 mutator** 积木才需要"占位符数 == params_desc 数"
+- `while_block / repeat_block` 只有 condition+body，无普通参数，不需要 params_desc
+- → 判据：先排除 `is_event`/`mutator`，再排除 body/condition，剩下的才比数量
+
+### 新修的真 bug（v3）
+1. **同一占位符在模板出现两次 → Blockly 生成两个同名输入/字段**（9 个积木：`print_var`、`world_spawncreature`、`gameobject_createprefab(inst)`、`block_destroy/place/replaceblock`、`backpack_getitemnum`、`actor_trymovetopos`）。修法：定义处与生成器处都加 `phs=phs.filter((v,i,a)=>a.indexOf(v)===i)`。注意 `{{x}} == nil and true or {{x}}` 这类"默认true"惯用法去重后仍正确
+2. **体检 openFnArgs 顶层键识别错** —— 正则写死 `^\s{4}`，但生成器输出是 **2 空格**，导致**所有已登记函数都被误报"未登记"**。改为收集全部 (缩进,键) 取最小缩进
+3. **体检多行规则逐行匹配失效** —— `Script.propertys = {\n  { name=` 跨行，逐行正则永远命中不了。新增 `LINT_BLOCK_RULES` 走整段匹配
+4. **体检 `math.log10` 是误报** —— 引擎 math 有 34 成员**含 log10**（用户探针实证）。已删除该规则
+5. 80 个基础积木（return/赋值/数学库/字符串库/表操作库/流程控制）**无 params_desc → UI 输入无标签**。已全部补齐（B 常量是无引号键 `{type:"x",...}`，补丁要分两种格式）
+
+### 新增体检规则（v3）
+- propertys 数组形式 → self.xxx 取 nil、default 全失效
+- openFnArgs 的 params 只有类型没名字 → 实机要名/类型交替
+- 属性区 `min/max` → 应为 `minValue/maxValue`（限定在 propertys 块内判定，避免误报普通变量）
+
+### 体检实测
+- 干净代码 → `null`（零误报）
+- 脏代码 → 正确报出 os.clock / `//` / bit32 / table.unpack / CloudSever / Studio / require / io / unpack遇nil / 属性数组形式 / min= / params无名 / 未登记函数
