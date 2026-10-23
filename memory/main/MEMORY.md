@@ -1115,3 +1115,96 @@ Backpack:PlayShortCutItemParticle(playerid, itemid, effectid) / PlayShortCutIxEf
 - 源码传入：`lua.globals().CODE = src`，再用 `loadstring(CODE)` 走 chunk 顶层
   （这样能测顶层 local 上限；`lua.execute("CODE = ...")` 拿不到参数，CODE 为 nil）。
 - mock 要补 `bit`（12 成员）和 `os.timeMs`，否则自检里这两项会假失败。
+
+## ⛔⛔ Lua 5.1 unpack 遇到 nil 空洞会截断参数（2026-10-22 实踩）
+
+```lua
+unpack({ 90001, nil, "xsKey" })   -- #{90001,nil,"xsKey"} 是未定义行为
+-- 实际可能只传 1 个参数，后面的静默丢失
+```
+
+**杀伤点**：KV 调用里"房间级"的 `playerId` 恰好就是 nil → 用 unpack 拼参数，
+`SetValue(varId, nil, key, val)` 实际只传了 varId → **写了个空键，返回 true，假成功**。
+表现：写 OK、读为空，**不报错**。
+
+**规则**：变体/可选参数一律写成**闭包显式传参**，绝不用 unpack：
+```lua
+{ function() return pcall(f, m, vid, pid, key) end,   -- 显式传 nil 安全
+  function() return pcall(f, m, vid, key) end }
+```
+
+## ⛔ 旧"跨存档传递"办法 = 字符串共享元表侧信道（已废）
+
+`跨存档信息传递.lua` / `跨存档JSON.lua` 用的是：
+```lua
+local mt = getmetatable("")   -- 所有字符串共享同一元表
+mt._data = str                -- 挂字段 = 往全局唯一共享对象挂
+```
+**原理**：不是跨存档 API，是**进程内全局状态泄漏**。引擎切换地图时若**未重建 LuaVM**，
+挂在 string metatable 上的数据就活到下一个存档 → 表现为"其他地图也能读"。
+
+**属于利用未定义行为，已被官方废除**（可能在切图时重建 VM / 元表只读 / 沙盒隔离）。
+同类旁路：`_G` 挂变量、string 表挂字段、`debug.getregistry()`、引擎模块表挂字段、
+`package.loaded`。**均不建议用于正式作品**，随时可能再废。
+
+**官方支持的跨存档手段只有二维表导入导出**（手动搬运）。
+`Data.Map` 用 `pid=uin`（私人级）**可能**跨存档+离线可读（= 好友说的"离线云读"），
+**待真机验证**：探针 `跨存档通道探针.lua`，换地图后看哪些通道带 ★。
+
+## 测试台补充（2026-10-22 修正）
+
+- lupa 2.8 的正确入口是 `from lupa import lua51; lua = lua51.LuaRuntime()`，
+  **不是** `lupa.LuaRuntime().create_lua51()`（该方法不存在，报 AttributeError）。
+  `lupa.LuaRuntime()` 是 Lua 5.5，会缺全局 `unpack`、整数 64 位不截断，测 5.1 脚本会失真。
+- 传源码：`lua.globals().CODE = src.replace("return Script", "XS = Script")`
+  再 `lua.execute("local _f = loadstring(CODE); _f()")`，取 `lua.globals().XS`。
+  直接 `lua.eval("loadstring(...)")` 返回 None（Lua function 无法转 Python 可调用）。
+
+## ★ Blockly 触发器转脚本工具（2026-10-23 逐个检测 + 优化）
+
+**文件**：`迷你世界3.0脚本Blockly编辑器_优化版.html` / `_v2.txt`（1,062,609 字节，md5 `4de2339e`）
+报告：`Blockly编辑器v2_检测与优化报告.md`。原版 5087 行 / 1133 积木 / 998 个 Lua 模板。
+
+### 检测方法（可复用）
+- 用 **Node 20 真实解析** `B / G / L / DATA_MAP` 四个 JS 常量成对象（不是正则扫），
+  再遍历全部积木。大 HTML 单常量可达 26 万字符一行，必须程序化提取。
+- 提取法：从 `const X=` 起扫描，括号计数 + 字符串状态机找闭合，写临时 .js 再 require。
+- 模板语法体检：占位符 `{{x}}` 替换成变量名后用 **lupa lua51** 逐个 compile；
+  表达式型套 `local __x = ...`，语句型套 `local function __f() ... end`。
+  ⚠️ 假阳性：`body` 占位符单独一行不是合法语句、`{{end}}` 是保留字、函数内 `break`。
+
+### 修的 4 个真 bug（全部"不报错"类型）
+1. **openFnArgs 的 params 缺参数名** —— 生成 `params = { Mini.String }`；
+   实机正确是**扁平数组、名/类型交替** `params = { "规格", Mini.String }`。
+   修：mutator 加 `PN+i` 参数名输入框（mutationToDom/domToMutation/decompose/compose/
+   saveExtraState/loadExtraState/updateShape_ 七处同步）+ 生成器读 `PN+i`。
+2. **`Data.Table:InsertValue(..., {{...}})` 变参** —— 实机每行只传一个字符串，
+   多传会把行号塞进第1列、数据挤到第2列，**静默错位**。已改单值。
+3. **8 个 World 积木用了 `{{x|y|z}}`** —— 占位符正则 `/\{\{(\w+)\}\}/g` 的 `\w+`
+   **匹配不到 `|`**，导致 UI 不生成插槽 + 生成代码原样输出 `{{x|y|z}}` → 导入即崩。
+   涉及 spawnprojectilebydir / getbiometype / getbiomegroup / findecosystem /
+   getraylength / getrayblock / calcdirectionbyyawdirection / setspawnpoint。
+4. **体检函数自己写错**：`out.push(...).concat(...)` —— push 返回**数字**不是数组，
+   被 try/catch 包住后**整个体检静默失效**。已改 `out.push(x); out=out.concat(y)`。
+
+### 新增 69 个积木（记忆库"确定存在、必须用、禁止降级"）
+bit 12 / os 3 / coroutine 7 + threadpool / math 扩展 17 / string 扩展 6 /
+table 扩展 9 + 全局 unpack / 全局函数 14（pcall/select/setmetatable…）。
+插在 `const DATA_MAP=` 前新增 `const X={...}`，把 `Object.assign({},G,L)` 改成
+`Object.assign({},G,L,X)`，再把子分类名加进 `SUBS["Lua全局库"]`。
+**架构**：DATA_MAP 会自动转成 jsonDefs + Lua 生成器，加数据即可，不用碰 UI 代码。
+
+### 新增能力
+- **导出前自动体检**（14 条规则）：os.clock / // / bit32 / table.unpack / goto /
+  CloudSever / Studio / ffi / jit / require / io / math.log10 / unpack 遇 nil / 中文标点，
+  外加 openFnArgs 登记表 vs `function Script:xxx` 双向一致性检查。
+  结果以注释插在代码头部。**这是把记忆库踩过的坑固化进工具的关键一步。**
+- 4 个"速查注释"积木：存储载体选型 / 二维表与KV作用域 / 引擎环境硬事实 / 组件表规范。
+- `arrayWrapper` 其余类型改为 `propertytype.__className_ or "Unknown"`
+  （记忆：这是九项细节里**唯一可安全改进**的一项）。
+- `World:GetAllPlayers()` 改无参（真机确认 PascalCase）。
+- CloudSever 两个积木标注 ⛔已废除；UpdateValueAndCallback 升级为 ★ 并写全三条铁律。
+
+### 未处理（非功能性）
+244 个老积木 `params_desc` 数量与占位符数不一致 —— 只影响 UI 参数标签显示，
+不影响生成代码（源码取不到就用空标签）。
