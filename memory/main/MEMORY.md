@@ -1235,3 +1235,55 @@ table 扩展 9 + 全局 unpack / 全局函数 14（pcall/select/setmetatable…�
 ### 体检实测
 - 干净代码 → `null`（零误报）
 - 脏代码 → 正确报出 os.clock / `//` / bit32 / table.unpack / CloudSever / Studio / require / io / unpack遇nil / 属性数组形式 / min= / params无名 / 未登记函数
+
+---
+
+## ⛔ 元件ID 与 界面ID（2026-10-24 用户实证，真机确认）
+
+### 核心规则（记住，别再问）
+**元件ID 自带界面ID：界面ID = 元件ID 按 `_` 划分的前面部分**
+
+```
+元件ID  7688218032430558205-110851_9
+界面ID  7688218032430558205-110851
+```
+
+即 `local uiid = string.match(elemId, "^(.-)_")` 或取第一个 `_` 之前。
+
+推论：
+- 界面ID **含连字符、不是数字**，所以属性必须用 `Mini.String`，不能 `Mini.Number`
+- 元件ID 不含 `_`（老式纯数字如 `12345`）时推不出来 → 必须回退到手填属性
+- 同一界面的不同元件，界面ID 相同、元件ID 的 `_` 后缀不同（_9、_10…）
+
+### 官方签名佐证（dev-wiki CustomUI）
+```
+CustomUI:SetText(objid:number, uiid:string, elementid:string, text:string, animid?, time?, mode?) -> bool
+CustomUI:HideElement(objid:number, uiid:string, elementid:string, ...)
+CustomUI:SetPosition(objid:number, uiid:string, elementid:string, x:number, y:number) -> code
+CustomUI:SetState(objid:number, uiid:string, elementid:string, pageIndex:string) -> code
+```
+**uiid 是 string，elementid 是 string。** 第2参界面ID、第3参元件ID，顺序别反。
+
+### 我犯过的错（计时器 v3）
+```lua
+uiId = { type = Mini.Number, default = 0 }   -- ✗
+local uid = _num(self.uiId, 0)                -- ✗ tonumber("...-110851") = nil -> 0
+pcall(cu.SetText, cu, p, uid, b.uiElement, txt)  -- uiid=0 -> 静默失败，pcall 吞掉
+```
+**症状**：UI 永远不刷新，不报错。因为 pcall 吞了返回 false。
+**修法（v3.1）**：属性改 `Mini.String`；新增 `_uiIdOf(elemId)` 自动推导；`_resolveUiId` 三级优先级
+（绑定自带 uiId > 元件ID推导 > 脚本属性 uiId）。
+
+### 通用教训
+**UI 相关属性类型必须按官方签名定，不能凭直觉。** number/string 弄错不会报错，只会静默失效。
+
+---
+
+## 计时器管理 v3.1（2026-10-24）
+
+- 产物：`计时器管理v3.1.lua` / `.txt`（31149 字节，md5 f78aa3f9）
+- 相对 v3 的改动：uiId 改 String + 自动推导 + `uiAutoDetect` 开关 + `BindUIToTimer` 加第5参「界面ID」
+  + 新增开放函数 `GetUIInfo`（看推导结果与来源）+ Check 加 5 项推导断言 + 加 [8] CustomUI 探测
+- 实测 42 项全过（编译/静态/合规/Check 26 项/端到端 SetText/三级回退/无 CustomUI 不崩/毫秒模式）
+- 环境说明：沙盒 lupa 只有 **Lua 5.4**（装不到 5.1，apt 无 lua5.1、lua.org 下载失败），
+  故另配 5.1 不兼容语法静态扫描（`//`、`goto`、`::label::`、`bit32`、`table.unpack`、`table.move`、`coroutine.close` 全 0）
