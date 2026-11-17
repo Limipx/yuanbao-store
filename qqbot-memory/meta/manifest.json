@@ -1,5 +1,9 @@
 {
   "schemaVersion": 1,
   "instanceId": "selftest",
-  "note": "插件自检写入"
+  "generatedAt": "2026-11-18T03:47:44+08:00",
+  "events": 3,
+  "nodes": 4,
+  "edges": 0,
+  "facts": 3
 }

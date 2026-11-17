@@ -1,0 +1,44 @@
+{
+  "generatedAt": "2026-11-18T03:47:44+08:00",
+  "facts": [
+    {
+      "body": "阿鱼是夜猫子，深夜最活跃",
+      "scope": "qq:selftest:group:G1",
+      "tags": [
+        "#夜猫子"
+      ],
+      "confidence": 1,
+      "source": "owner",
+      "status": "live",
+      "validFrom": "2026-11-18T03:47:43+08:00",
+      "validTo": null,
+      "lastSeen": "2026-11-18T03:47:43+08:00"
+    },
+    {
+      "body": "阿鱼爱发猫图",
+      "scope": "qq:selftest:group:G1",
+      "tags": [
+        "#猫图"
+      ],
+      "confidence": 1,
+      "source": "owner",
+      "status": "live",
+      "validFrom": "2026-11-18T03:47:43+08:00",
+      "validTo": null,
+      "lastSeen": "2026-11-18T03:47:43+08:00"
+    },
+    {
+      "body": "群里有人叫小鱼，喜欢钓鱼",
+      "scope": "qq:selftest:group:G1",
+      "tags": [
+        "#钓鱼"
+      ],
+      "confidence": 0.7,
+      "source": "observed",
+      "status": "live",
+      "validFrom": "2026-11-18T03:47:43+08:00",
+      "validTo": null,
+      "lastSeen": "2026-11-18T03:47:43+08:00"
+    }
+  ]
+}
