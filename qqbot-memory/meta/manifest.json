@@ -1,9 +1,10 @@
 {
   "schemaVersion": 1,
-  "instanceId": "selftest",
-  "generatedAt": "2026-11-18T03:47:44+08:00",
-  "events": 3,
-  "nodes": 4,
+  "instanceId": "unbound",
+  "generatedAt": null,
+  "events": 0,
+  "nodes": 0,
   "edges": 0,
-  "facts": 3
+  "facts": 0,
+  "note": "结构已就绪，等插件接入"
 }
