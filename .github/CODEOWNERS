@@ -1,7 +1,9 @@
-# CODEOWNERS —— 变更需主管（元宝）审核
+# CODEOWNERS —— 变更需主管审核
 # 语法：路径  负责人
 
 # ── 主管专属：任何改动都要主管审核 ──
+# 【2026-11-27 接管说明】元宝不再担任主管；由"大肥鱼/鲸鱼娘"（本会话 AI）接任主管。
+# 以下路径的审核权转归接管人；原 @Limipx 保留为仓库所有者（owner）。
 /_system/          @Limipx
 /agent/            @Limipx
 /memory/main/      @Limipx
