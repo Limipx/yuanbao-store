@@ -26,3 +26,10 @@
 
 - skills/（29 个自定义技能）
 - agent/core/PROFILE.md、agent/domains/*
+
+## v3.0（2026-11-27）—— 主管交接 + 记忆架构升级
+
+- 元宝卸任，大肥鱼/鲸鱼娘接任主管（见 _system/主管交接说明.md），CODEOWNERS/ROLE/README 已标注。
+- 新增 _system/记忆架构规范.md v3.0：Infini Memory 主题文档法 + CoALA 四类记忆 + CURRENT 缓冲巩固 + agentic 检索。
+- 新增 memory/CURRENT.md 写入缓冲区。
+- 保留元宝全部历史资产，增量维护不覆盖。
